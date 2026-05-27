@@ -17,10 +17,49 @@ atomically when you activate a different profile.  It also provides `status` and
 
 ---
 
+## Quick start
+
+A complete two-account walkthrough for Claude (Codex is identical except it has
+no `login` subcommand — you log in with `codex` manually, then `save`).
+
+```sh
+# 1. You are already logged into your first account. Snapshot it as profile "A".
+claude-switch save A
+
+# 2. Add a second account. `login` runs an isolated `claude auth login`
+#    and stores the result as profile "B" without disturbing A.
+claude-switch login B
+
+# 3. See what you have.
+claude-switch status
+#   Active profile: A
+#   Saved profiles: A B
+
+# 4. Switch to B  — ALWAYS exit the running claude session first, then:
+claude-switch B
+claude            # start a fresh session, now on account B
+
+# 5. Switch back the same way: exit claude, then `claude-switch A`.
+```
+
+For Codex (no `login` helper):
+
+```sh
+codex-switch save A          # snapshot the currently logged-in codex account
+# log out and log into the other account with `codex` itself, then:
+codex-switch save B
+# switch: exit codex, then `codex-switch A` (or B), then start `codex` fresh.
+```
+
+> The golden rule: **exit the running CLI before every switch.** A live process
+> holds its token in memory and will overwrite the profile you just swapped in.
+
+---
+
 ## Install
 
 ```sh
-git clone https://github.com/your-org/flipauth.git ~/flipauth
+git clone https://github.com/halmisen/flipauth.git ~/flipauth
 
 # Option A — add repo dir to PATH
 echo 'export PATH="$HOME/flipauth:$PATH"' >> ~/.bashrc
