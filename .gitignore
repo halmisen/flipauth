@@ -1,0 +1,8 @@
+# Credential and runtime artifacts — must never be committed
+*.credentials.json
+auth.json
+oauth-accounts/
+.active-profile
+.login-*
+*.tmp
+.oauth-switch.*

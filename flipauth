@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# flipauth — OAuth profile switcher for the official Claude Code and Codex CLIs.
+# Service is resolved from the invocation name ($0):
+#   claude-switch ...       -> service=claude
+#   codex-switch  ...       -> service=codex
+#   flipauth <svc> ...      -> service=<svc>  (claude|codex)
+#
+# Platform: Windows WSL only.
+
+PROG="$(basename "$0")"
+
+fail() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+case "$PROG" in
+  claude-switch) SERVICE=claude ;;
+  codex-switch)  SERVICE=codex ;;
+  *)
+    SERVICE="${1:-}"
+    [[ -n "$SERVICE" ]] || fail "usage: flipauth <claude|codex> <command> [args]"
+    shift
+    ;;
+esac
+[[ "$SERVICE" == claude || "$SERVICE" == codex ]] ||
+  fail "unknown service '$SERVICE' (expected claude or codex)"
+
+# Index-aligned arrays describe the managed runtime files:
+#   ACTIVE[i]   absolute path of the live file
+#   SUFFIX[i]   saved-profile filename suffix (profile file = <name>.<suffix>)
+#   REQUIRED[i] "yes" if the live file must exist to save, "no" if optional
+declare -a ACTIVE SUFFIX REQUIRED
+
+if [[ "$SERVICE" == claude ]]; then
+  DIR="${CLAUDE_SWITCH_CLAUDE_DIR:-$HOME/.claude}"
+  STATE_DIR="${CLAUDE_SWITCH_STATE_DIR:-$DIR/oauth-accounts}"
+  ACTIVE=( "${CLAUDE_SWITCH_CREDENTIALS_FILE:-$DIR/.credentials.json}" )
+  SUFFIX=( "credentials.json" )
+  REQUIRED=( "yes" )
+  LABEL="Claude"
+else
+  DIR="${CODEX_SWITCH_CODEX_DIR:-$HOME/.codex}"
+  STATE_DIR="${CODEX_SWITCH_STATE_DIR:-$DIR/oauth-accounts}"
+  ACTIVE=( "${CODEX_SWITCH_AUTH_FILE:-$DIR/auth.json}" "${CODEX_SWITCH_CREDENTIALS_FILE:-$DIR/.credentials.json}" )
+  SUFFIX=( "auth.json" "credentials.json" )
+  REQUIRED=( "yes" "no" )
+  LABEL="Codex"
+fi
+
+ACTIVE_MARKER="$STATE_DIR/.active-profile"
+
+usage() {
+  cat <<USAGE
+Usage:
+  $PROG save <profile>
+  $PROG <profile>
+  $PROG status
+  $PROG doctor
+USAGE
+  [[ "$SERVICE" == claude ]] && printf '  %s login <profile> [claude auth login options]\n' "$PROG"
+  return 0
+}
+
+validate_profile_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] ||
+    fail "profile names must use letters, digits, underscores, or hyphens"
+}
+
+profile_path() { printf '%s/%s.%s\n' "$STATE_DIR" "$1" "${SUFFIX[$2]}"; }
+
+ensure_state_dir() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
+
+validate_json_object() {
+  python3 - "$1" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(p.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    raise SystemExit(f"missing credentials file: {p}")
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid credentials file {p}: {exc}")
+if not isinstance(payload, dict):
+    raise SystemExit(f"unexpected credentials shape in {p}: expected object")
+PY
+}
+
+validate_claude_credentials() {
+  python3 - "$1" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+try:
+    payload = json.loads(p.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    raise SystemExit(f"missing credentials file: {p}")
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid credentials file {p}: {exc}")
+if not isinstance(payload, dict) or set(payload) != {"claudeAiOauth"}:
+    raise SystemExit(f"unexpected credentials shape in {p}: expected only claudeAiOauth")
+if not isinstance(payload["claudeAiOauth"], dict):
+    raise SystemExit(f"unexpected claudeAiOauth value in {p}: expected an object")
+PY
+}
+
+validate_file() {
+  if [[ "$SERVICE" == claude ]]; then validate_claude_credentials "$1"; else validate_json_object "$1"; fi
+}
+
+atomic_copy() {
+  local src="$1" dst="$2" dir tmp
+  dir="$(dirname "$dst")"; mkdir -p "$dir"; umask 077
+  tmp="$(mktemp "$dir/.oauth-switch.XXXXXX")"
+  if ! install -m 600 "$src" "$tmp"; then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$dst"; chmod 600 "$dst"
+}
+
+write_active_marker() {
+  local tmp; umask 077
+  tmp="$(mktemp "$STATE_DIR/.active-profile.XXXXXX")"
+  printf '%s\n' "$1" > "$tmp"; mv -f "$tmp" "$ACTIVE_MARKER"; chmod 600 "$ACTIVE_MARKER"
+}
+
+read_active_marker() {
+  local p
+  [[ -f "$ACTIVE_MARKER" ]] || return 1
+  IFS= read -r p < "$ACTIVE_MARKER" || return 1
+  validate_profile_name "$p"; printf '%s\n' "$p"
+}
+
+validate_active() {
+  local i
+  for i in "${!ACTIVE[@]}"; do
+    if [[ "${REQUIRED[$i]}" == yes ]]; then validate_file "${ACTIVE[$i]}"
+    elif [[ -f "${ACTIVE[$i]}" ]]; then validate_json_object "${ACTIVE[$i]}"; fi
+  done
+}
+
+validate_profile_files() {
+  local i path
+  for i in "${!ACTIVE[@]}"; do
+    path="$(profile_path "$1" "$i")"
+    if [[ "${REQUIRED[$i]}" == yes ]]; then validate_file "$path"
+    elif [[ -f "$path" ]]; then validate_json_object "$path"; fi
+  done
+}
+
+save_active_into() {
+  local i path
+  for i in "${!ACTIVE[@]}"; do
+    if [[ -f "${ACTIVE[$i]}" ]]; then
+      path="$(profile_path "$1" "$i")"
+      atomic_copy "${ACTIVE[$i]}" "$path"
+    elif [[ "${REQUIRED[$i]}" == yes ]]; then
+      fail "required active file disappeared: ${ACTIVE[$i]}"
+    fi
+  done
+}
+
+load_profile_into_active() {
+  local i path
+  for i in "${!ACTIVE[@]}"; do
+    path="$(profile_path "$1" "$i")"
+    if [[ -f "$path" ]]; then
+      atomic_copy "$path" "${ACTIVE[$i]}"
+    elif [[ "${REQUIRED[$i]}" == yes ]]; then
+      fail "required profile file disappeared: $path"
+    fi
+  done
+}
+
+cmd_save() {
+  validate_profile_name "$1"; ensure_state_dir; validate_active
+  save_active_into "$1"; write_active_marker "$1"
+  printf 'Saved active %s OAuth credentials as profile %s.\n' "$LABEL" "$1"
+}
+
+cmd_activate() {
+  validate_profile_name "$1"; ensure_state_dir; validate_profile_files "$1"
+  local current=""
+  if current="$(read_active_marker)"; then
+    if [[ -f "${ACTIVE[0]}" ]]; then validate_active; save_active_into "$current"; fi
+    if [[ "$current" == "$1" && -f "${ACTIVE[0]}" ]]; then
+      printf 'Profile %s is already active; refreshed its saved credentials.\n' "$1"; return
+    fi
+  elif [[ -e "${ACTIVE[0]}" ]]; then
+    fail "active credentials are untracked; run '$PROG save <profile>' first"
+  fi
+  load_profile_into_active "$1"; write_active_marker "$1"
+  if [[ "$SERVICE" == codex ]]; then
+    printf 'Activated Codex OAuth profile %s. Start a fresh codex process for this account.\n' "$1"
+  else
+    printf 'Activated Claude OAuth profile %s.\n' "$1"
+  fi
+}
+
+cmd_status() {
+  local current="" f files=()
+  if current="$(read_active_marker 2>/dev/null)"; then printf 'Active profile: %s\n' "$current"
+  else printf 'Active profile: untracked\n'; fi
+  if [[ -d "$STATE_DIR" ]]; then
+    shopt -s nullglob; files=("$STATE_DIR"/*."${SUFFIX[0]}"); shopt -u nullglob
+  fi
+  printf 'Saved profiles:'
+  if [[ "${#files[@]}" -eq 0 ]]; then printf ' none\n'; return; fi
+  for f in "${files[@]}"; do printf ' %s' "$(basename "$f" ".${SUFFIX[0]}")"; done
+  printf '\n'
+}
+
+cmd_login() {
+  [[ "$SERVICE" == claude ]] || fail "login is not supported for $SERVICE; use 'codex login' manually"
+  local profile="$1"; shift
+  validate_profile_name "$profile"; ensure_state_dir
+  command -v claude >/dev/null 2>&1 || fail "claude command not found"
+  local login_dir login_creds current=""
+  login_dir="$(mktemp -d "$STATE_DIR/.login-$profile.XXXXXX")"
+  login_creds="$login_dir/.credentials.json"
+  if ! CLAUDE_CONFIG_DIR="$login_dir" claude auth login "$@"; then
+    rm -rf "$login_dir"; fail "Claude login did not complete"
+  fi
+  validate_claude_credentials "$login_creds"
+  atomic_copy "$login_creds" "$(profile_path "$profile" 0)"
+  if current="$(read_active_marker)" && [[ "$current" == "$profile" ]]; then
+    atomic_copy "$login_creds" "${ACTIVE[0]}"
+    printf 'Re-authenticated active Claude OAuth profile %s.\n' "$profile"
+  else
+    printf 'Saved Claude OAuth login as profile %s.\n' "$profile"
+    printf 'Activate it with: %s %s\n' "$PROG" "$profile"
+  fi
+  rm -rf "$login_dir"
+}
+
+# Resolve the Windows-side Codex auth path.
+# Priority: CODEX_SWITCH_WINDOWS_AUTH env var > wslvar/wslpath detection > empty.
+_resolve_windows_auth() {
+  # If the variable is set (even to empty), use its value and skip auto-detection.
+  # Empty value = explicitly disabled; non-empty = explicit path override.
+  if [[ "${CODEX_SWITCH_WINDOWS_AUTH+set}" == set ]]; then
+    printf '%s' "${CODEX_SWITCH_WINDOWS_AUTH}"
+    return
+  fi
+  # Try wslvar (part of wslu package)
+  local userprofile wsl_path
+  if userprofile="$(wslvar USERPROFILE 2>/dev/null)" && [[ -n "$userprofile" ]]; then
+    if wsl_path="$(wslpath "$userprofile" 2>/dev/null)" && [[ -n "$wsl_path" ]]; then
+      printf '%s/.codex/auth.json' "$wsl_path"
+      return
+    fi
+  fi
+  # Try cmd.exe as fallback
+  if userprofile="$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n')" && [[ -n "$userprofile" && "$userprofile" != '%USERPROFILE%' ]]; then
+    if wsl_path="$(wslpath "$userprofile" 2>/dev/null)" && [[ -n "$wsl_path" ]]; then
+      printf '%s/.codex/auth.json' "$wsl_path"
+      return
+    fi
+  fi
+  printf ''
+}
+
+doctor_codex() {
+  local windows_auth_path
+  windows_auth_path="$(_resolve_windows_auth)"
+  python3 - "$DIR" "${ACTIVE[0]}" "${ACTIVE[1]}" "$STATE_DIR" "$ACTIVE_MARKER" "$windows_auth_path" <<'PY'
+import base64, hashlib, json, pathlib, stat, sys, time
+codex_dir = pathlib.Path(sys.argv[1]); active_auth = pathlib.Path(sys.argv[2])
+active_credentials = pathlib.Path(sys.argv[3]); state_dir = pathlib.Path(sys.argv[4])
+active_marker = pathlib.Path(sys.argv[5])
+_win_arg = sys.argv[6] if len(sys.argv) > 6 else ""
+windows_auth = pathlib.Path(_win_arg) if _win_arg else None
+
+def sha16(data): return hashlib.sha256(data).hexdigest()[:16]
+def fp(value): return "none" if not value else hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+def decode_jwt_payload(token):
+    parts = token.split(".")
+    if len(parts) < 2: return {}
+    raw = parts[1] + "=" * (-len(parts[1]) % 4)
+    try: return json.loads(base64.urlsafe_b64decode(raw.encode("utf-8")))
+    except Exception: return {}
+
+def auth_summary(path):
+    if not path.exists(): return {"exists": False}
+    data = path.read_bytes()
+    s = {"exists": True, "auth_mode": "unknown", "identity_fp": "unknown", "sub_fp": "unknown", "access_exp": "unknown"}
+    try: payload = json.loads(data.decode("utf-8"))
+    except Exception: return s
+    if not isinstance(payload, dict): return s
+    s["auth_mode"] = str(payload.get("auth_mode", "unknown"))
+    tokens = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+    access = tokens.get("access_token") or payload.get("OPENAI_API_KEY") or ""
+    claims = decode_jwt_payload(access) if isinstance(access, str) else {}
+    s["identity_fp"] = fp(claims.get("https://api.openai.com/auth") or claims.get("sub"))
+    s["sub_fp"] = fp(claims.get("sub"))
+    exp = claims.get("exp")
+    if isinstance(exp, int): s["access_exp"] = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(exp))
+    return s
+
+def file_line(label, path):
+    if not path.exists(): print(f"{label}: missing {path}"); return
+    data = path.read_bytes(); mode = stat.S_IMODE(path.stat().st_mode)
+    try: valid = isinstance(json.loads(data.decode("utf-8")), dict)
+    except Exception: valid = False
+    print(f"{label}: path={path} mode={oct(mode)} size={len(data)} sha16={sha16(data)} json_object={str(valid).lower()}")
+
+print("Codex switch doctor")
+print(f"codex_dir: {codex_dir}")
+print(f"state_dir: {state_dir}")
+if active_marker.exists():
+    try: print(f"active_profile: {active_marker.read_text(encoding='utf-8').strip()}")
+    except Exception as exc: print(f"active_profile: unreadable ({exc})")
+else: print("active_profile: untracked")
+profiles = sorted(p.name.removesuffix(".auth.json") for p in state_dir.glob("*.auth.json")) if state_dir.exists() else []
+print("saved_profiles:", " ".join(profiles) if profiles else "none")
+file_line("wsl_auth", active_auth)
+file_line("wsl_credentials", active_credentials)
+if state_dir.exists(): print(f"state_dir_mode: {oct(stat.S_IMODE(state_dir.stat().st_mode))}")
+wsl = auth_summary(active_auth)
+if wsl.get("exists"):
+    print(f"wsl_identity: auth_mode={wsl['auth_mode']} identity_fp={wsl['identity_fp']} sub_fp={wsl['sub_fp']} access_exp={wsl['access_exp']}")
+else: print("wsl_identity: missing")
+if windows_auth is None:
+    print("windows_identity: not configured")
+elif not windows_auth.exists():
+    print(f"windows_identity: missing {windows_auth}")
+else:
+    win = auth_summary(windows_auth)
+    print(f"windows_identity: path={windows_auth} auth_mode={win['auth_mode']} identity_fp={win['identity_fp']} sub_fp={win['sub_fp']} access_exp={win['access_exp']}")
+    if wsl.get("exists") and wsl.get("identity_fp") != "unknown":
+        print(f"wsl_windows_same_identity: {str(wsl.get('identity_fp') == win.get('identity_fp')).lower()}")
+print("scope: manages WSL Codex CLI only; Windows Codex App remains manual")
+PY
+}
+
+doctor_claude() {
+  python3 - "$DIR" "${ACTIVE[0]}" "$STATE_DIR" "$ACTIVE_MARKER" <<'PY'
+import hashlib, json, pathlib, stat, sys, time
+claude_dir = pathlib.Path(sys.argv[1]); active = pathlib.Path(sys.argv[2])
+state_dir = pathlib.Path(sys.argv[3]); active_marker = pathlib.Path(sys.argv[4])
+
+def sha16(data): return hashlib.sha256(data).hexdigest()[:16]
+
+print("Claude switch doctor")
+print(f"claude_dir: {claude_dir}")
+print(f"state_dir: {state_dir}")
+if active_marker.exists():
+    try: print(f"active_profile: {active_marker.read_text(encoding='utf-8').strip()}")
+    except Exception as exc: print(f"active_profile: unreadable ({exc})")
+else: print("active_profile: untracked")
+profiles = sorted(p.name.removesuffix(".credentials.json") for p in state_dir.glob("*.credentials.json")) if state_dir.exists() else []
+print("saved_profiles:", " ".join(profiles) if profiles else "none")
+
+if active.exists():
+    data = active.read_bytes(); mode = stat.S_IMODE(active.stat().st_mode)
+    try: payload = json.loads(data.decode("utf-8")); valid = isinstance(payload, dict)
+    except Exception: payload = {}; valid = False
+    print(f"active_credentials: path={active} mode={oct(mode)} size={len(data)} sha16={sha16(data)} json_object={str(valid).lower()}")
+    oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
+    if isinstance(oauth, dict):
+        print(f"subscription_type: {oauth.get('subscriptionType', 'unknown')}")
+        exp = oauth.get("expiresAt")
+        if isinstance(exp, (int, float)):
+            print(f"expires_at: {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(exp / 1000))}")
+        else:
+            print("expires_at: unknown")
+    else:
+        print("subscription_type: unknown")
+        print("expires_at: unknown")
+else:
+    print(f"active_credentials: missing {active}")
+if state_dir.exists(): print(f"state_dir_mode: {oct(stat.S_IMODE(state_dir.stat().st_mode))}")
+print("note: Claude access token is opaque (not a JWT); identity/email are not derivable here")
+print("scope: manages WSL Claude Code credentials only")
+PY
+}
+
+cmd_doctor() {
+  if [[ "$SERVICE" == codex ]]; then doctor_codex; else doctor_claude; fi
+}
+
+case "${1:-}" in
+  save)   [[ "$#" -eq 2 ]] || fail "save requires exactly one profile name"; cmd_save "$2" ;;
+  status) [[ "$#" -eq 1 ]] || fail "status takes no extra arguments"; cmd_status ;;
+  doctor) [[ "$#" -eq 1 ]] || fail "doctor takes no extra arguments"; cmd_doctor ;;
+  login)  [[ "$#" -ge 2 ]] || fail "login requires a profile name"; p="$2"; shift 2; cmd_login "$p" "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *)      [[ "$#" -eq 1 ]] || fail "activation takes exactly one profile name"; cmd_activate "$1" ;;
+esac
