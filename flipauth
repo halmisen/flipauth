@@ -57,6 +57,7 @@ Usage:
   $PROG status
   $PROG doctor
 USAGE
+  [[ "$SERVICE" == claude ]] && printf '  %s quota [profile]\n' "$PROG"
   [[ "$SERVICE" == claude ]] && printf '  %s login <profile> [claude auth login options]\n' "$PROG"
   return 0
 }
@@ -375,10 +376,127 @@ cmd_doctor() {
   if [[ "$SERVICE" == codex ]]; then doctor_codex; else doctor_claude; fi
 }
 
+# Read the Claude Code version for the required User-Agent, falling back to a
+# recent default if the claude CLI is not installed.
+_claude_user_agent() {
+  local ver=""
+  if command -v claude >/dev/null 2>&1; then
+    ver="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  fi
+  printf 'claude-code/%s' "${ver:-2.1.181}"
+}
+
+# Query Anthropic's OAuth usage endpoint for each saved Claude profile and print
+# 5-hour / 7-day rolling-window utilization plus reset countdowns. This is the
+# only command that makes a network call; everything else is offline file work.
+quota_claude() {
+  local user_agent api_base want="${1:-}"
+  user_agent="$(_claude_user_agent)"
+  api_base="${CLAUDE_SWITCH_API_BASE:-https://api.anthropic.com}"
+  python3 - "$STATE_DIR" "$ACTIVE_MARKER" "${ACTIVE[0]}" "$user_agent" "$api_base" "$want" <<'PY'
+import json, pathlib, sys, urllib.request, urllib.error
+from datetime import datetime, timezone
+
+state_dir = pathlib.Path(sys.argv[1]); active_marker = pathlib.Path(sys.argv[2])
+live = pathlib.Path(sys.argv[3]); user_agent = sys.argv[4]
+api_base = sys.argv[5].rstrip("/"); want = sys.argv[6]
+
+active = ""
+if active_marker.exists():
+    try: active = active_marker.read_text(encoding="utf-8").strip()
+    except Exception: active = ""
+
+# Collect profiles: name -> credentials path. The active profile uses the live
+# file (freshest token); others use their saved snapshot (may be stale/expired).
+profiles = {}
+if state_dir.exists():
+    for p in sorted(state_dir.glob("*.credentials.json")):
+        profiles[p.name[: -len(".credentials.json")]] = p
+if active and live.exists():
+    profiles[active] = live
+if want:
+    profiles = {k: v for k, v in profiles.items() if k == want}
+    if not profiles:
+        print(f"no saved profile named {want}"); raise SystemExit(1)
+if not profiles:
+    print("Saved profiles: none"); raise SystemExit(0)
+
+def token_of(path):
+    try:
+        oauth = json.loads(path.read_text(encoding="utf-8"))["claudeAiOauth"]
+        return oauth.get("accessToken") or ""
+    except Exception:
+        return ""
+
+def fetch(token):
+    req = urllib.request.Request(
+        f"{api_base}/api/oauth/usage",
+        headers={"Authorization": f"Bearer {token}",
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "User-Agent": user_agent,
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def rel(iso):
+    if not iso: return "—"
+    try: dt = datetime.fromisoformat(iso)
+    except Exception: return "?"
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    secs = (dt - datetime.now(timezone.utc)).total_seconds()
+    if secs <= 0: return "due"
+    d, rem = divmod(int(secs), 86400); h, rem = divmod(rem, 3600); m = rem // 60
+    if d: return f"in {d}d{h}h"
+    if h: return f"in {h}h{m:02d}m"
+    return f"in {m}m"
+
+def pct(window):
+    if not isinstance(window, dict): return "—", ""
+    u = window.get("utilization")
+    return (f"{u:.0f}%" if isinstance(u, (int, float)) else "—",
+            rel(window.get("resets_at")))
+
+rows = []
+for name, path in profiles.items():
+    mark = "*" if name == active else " "
+    token = token_of(path)
+    if not token:
+        rows.append((mark, name, "no token", "", "", "")); continue
+    try:
+        data = fetch(token)
+    except urllib.error.HTTPError as e:
+        msg = {401: "token expired — re-activate", 403: "forbidden",
+               429: "rate limited (retry >180s)"}.get(e.code, f"HTTP {e.code}")
+        rows.append((mark, name, msg, "", "", "")); continue
+    except Exception as e:
+        rows.append((mark, name, f"error: {type(e).__name__}", "", "", "")); continue
+    h5, h5r = pct(data.get("five_hour"))
+    d7, d7r = pct(data.get("seven_day"))
+    rows.append((mark, name, h5, h5r, d7, d7r))
+
+w = max(len(r[1]) for r in rows + [("", "Profile", "", "", "", "")])
+print(f"  {'Profile':<{w}}  {'5h':>5}  {'resets':>8}  {'7d':>5}  {'resets':>8}")
+for mark, name, h5, h5r, d7, d7r in rows:
+    if h5r == "" and d7 == "":  # error/status row spans the data columns
+        print(f"{mark} {name:<{w}}  {h5}")
+    else:
+        print(f"{mark} {name:<{w}}  {h5:>5}  {h5r:>8}  {d7:>5}  {d7r:>8}")
+print("* = active profile")
+PY
+}
+
+cmd_quota() {
+  [[ "$SERVICE" == claude ]] ||
+    fail "quota is Claude-only (Anthropic OAuth usage endpoint); not supported for $SERVICE"
+  [[ -n "${1:-}" ]] && validate_profile_name "$1"
+  quota_claude "${1:-}"
+}
+
 case "${1:-}" in
   save)   [[ "$#" -eq 2 ]] || fail "save requires exactly one profile name"; cmd_save "$2" ;;
   status) [[ "$#" -eq 1 ]] || fail "status takes no extra arguments"; cmd_status ;;
   doctor) [[ "$#" -eq 1 ]] || fail "doctor takes no extra arguments"; cmd_doctor ;;
+  quota)  [[ "$#" -le 2 ]] || fail "quota takes an optional profile name"; cmd_quota "${2:-}" ;;
   login)  [[ "$#" -ge 2 ]] || fail "login requires a profile name"; p="$2"; shift 2; cmd_login "$p" "$@" ;;
   ""|-h|--help|help) usage ;;
   *)      [[ "$#" -eq 1 ]] || fail "activation takes exactly one profile name"; cmd_activate "$1" ;;

@@ -6,3 +6,11 @@ oauth-accounts/
 .login-*
 *.tmp
 .oauth-switch.*
+
+# Local operator notes for private account labels, machine paths, token history,
+# and harness-specific background. This project is open source; keep those notes
+# out of GitHub and maintain them in ignored local files instead.
+README.local.md
+*.local.md
+docs/local/
+docs/private/
