@@ -10,7 +10,7 @@ check() { local desc="$1"; shift; if "$@"; then printf 'ok   - %s\n' "$desc"; el
 mode_is() { [[ "$(stat -c '%a' "$1")" == "$2" ]]; }
 has() { grep -q "$2" "$1"; }
 
-# ---------- claude (single file, strict shape) ----------
+# ---------- claude (single file, Claude OAuth shape with optional extra blocks) ----------
 CL="$TMP/claude"; mkdir -p "$CL"
 export CLAUDE_SWITCH_CLAUDE_DIR="$CL"
 printf '%s' '{"claudeAiOauth":{"accessToken":"tok-one","subscriptionType":"pro","expiresAt":1779870689090}}' > "$CL/.credentials.json"
@@ -19,11 +19,12 @@ check "claude save creates profile file" test -f "$CL/oauth-accounts/one.credent
 check "claude state dir mode 700" mode_is "$CL/oauth-accounts" 700
 check "claude profile file mode 600" mode_is "$CL/oauth-accounts/one.credentials.json" 600
 check "claude marker = one" has "$CL/oauth-accounts/.active-profile" '^one$'
-printf '%s' '{"claudeAiOauth":{"accessToken":"tok-two"}}' > "$CL/.credentials.json"
+printf '%s' '{"claudeAiOauth":{"accessToken":"tok-two"},"designOauth":{"accessToken":"design-two"}}' > "$CL/.credentials.json"
 "$BIN_DIR/claude-switch" save two >/dev/null
 "$BIN_DIR/claude-switch" one >/dev/null
 check "claude activate one restores tok-one" has "$CL/.credentials.json" 'tok-one'
 check "claude saved two before switching away" has "$CL/oauth-accounts/two.credentials.json" 'tok-two'
+check "claude preserves extra oauth blocks" has "$CL/oauth-accounts/two.credentials.json" 'design-two'
 check "claude status lists one two" bash -c "\"$BIN_DIR/claude-switch\" status | grep -q 'Saved profiles: one two'"
 printf '%s' '{"wrong":1}' > "$CL/.credentials.json"
 check "claude save rejects wrong shape" bash -c "! \"$BIN_DIR/claude-switch\" save bad 2>/dev/null"
