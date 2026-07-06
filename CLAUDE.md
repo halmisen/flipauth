@@ -51,7 +51,8 @@ Directories are mode `700`, files mode `600`.
 
 **Atomic, validated swaps.** `atomic_copy` writes to a `mktemp` temp file then `mv -f` into
 place (never a partial write). Credentials are validated *before* save and *before* load:
-Claude requires a strict `{"claudeAiOauth": {...}}` shape; Codex accepts any JSON object.
+Claude requires a top-level JSON object with a `claudeAiOauth` object and allows additional
+Claude-managed OAuth blocks such as `designOauth`; Codex accepts any JSON object.
 `cmd_activate` auto-saves the currently-live credentials back into the outgoing profile
 before loading the new one, so an in-progress token refresh is never silently lost.
 
@@ -77,9 +78,10 @@ no-token-leak and no-false-identity guarantees; both are covered by tests.
 
 ## Conventions
 
-- **Credential shapes are load-bearing.** The Claude validator rejects anything other than
-  exactly `{"claudeAiOauth": ...}`. If Anthropic changes the on-disk format, this validator
-  and the doctor parsing must change together.
+- **Credential shapes are load-bearing.** The Claude validator must require a valid
+  `claudeAiOauth` object but preserve extra top-level OAuth blocks that the official CLI
+  writes. If Anthropic changes the on-disk format again, this validator and the doctor
+  parsing must change together.
 - **The golden rule is a real correctness constraint, not advice:** a live `claude`/`codex`
   process holds tokens in memory and can write a stale token back over a freshly-activated
   profile. User-facing messages reinforce "start a fresh process"; keep that intent.

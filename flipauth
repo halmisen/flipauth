@@ -96,8 +96,10 @@ except FileNotFoundError:
     raise SystemExit(f"missing credentials file: {p}")
 except (OSError, json.JSONDecodeError) as exc:
     raise SystemExit(f"invalid credentials file {p}: {exc}")
-if not isinstance(payload, dict) or set(payload) != {"claudeAiOauth"}:
-    raise SystemExit(f"unexpected credentials shape in {p}: expected only claudeAiOauth")
+if not isinstance(payload, dict):
+    raise SystemExit(f"unexpected credentials shape in {p}: expected object")
+if "claudeAiOauth" not in payload:
+    raise SystemExit(f"unexpected credentials shape in {p}: expected claudeAiOauth")
 if not isinstance(payload["claudeAiOauth"], dict):
     raise SystemExit(f"unexpected claudeAiOauth value in {p}: expected an object")
 PY
