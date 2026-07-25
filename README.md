@@ -68,16 +68,28 @@ Clone the repo and put `flipauth` on your `PATH`:
 
 ```sh
 git clone https://github.com/halmisen/flipauth.git ~/flipauth
-mkdir -p ~/bin
-ln -s ~/flipauth/flipauth ~/bin/flipauth
+mkdir -p ~/.local/bin
+ln -s ~/flipauth/flipauth ~/.local/bin/flipauth
 ```
 
 Optional shorthand commands can point to the same file:
 
 ```sh
-ln -s ~/flipauth/flipauth ~/bin/claude-switch
-ln -s ~/flipauth/flipauth ~/bin/codex-switch
+ln -s ~/flipauth/flipauth ~/.local/bin/claude-switch
+ln -s ~/flipauth/flipauth ~/.local/bin/codex-switch
 ```
+
+Check that it worked:
+
+```sh
+flipauth claude doctor
+```
+
+If your shell reports `command not found`, `~/.local/bin` is not on your `PATH`.
+Add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` (or `~/.zshrc`) and open
+a new terminal. Avoid `~/bin` for this: on Debian/Ubuntu the default `~/.profile`
+only adds it when the directory already existed at login, so a freshly created
+`~/bin` stays off your `PATH` until you log in again.
 
 ## Quick start
 
@@ -358,16 +370,27 @@ Windows WSL。不支持也未测试 macOS 与原生 Windows。
 
 ```sh
 git clone https://github.com/halmisen/flipauth.git ~/flipauth
-mkdir -p ~/bin
-ln -s ~/flipauth/flipauth ~/bin/flipauth
+mkdir -p ~/.local/bin
+ln -s ~/flipauth/flipauth ~/.local/bin/flipauth
 ```
 
 可选的简写命令可以指向同一个文件：
 
 ```sh
-ln -s ~/flipauth/flipauth ~/bin/claude-switch
-ln -s ~/flipauth/flipauth ~/bin/codex-switch
+ln -s ~/flipauth/flipauth ~/.local/bin/claude-switch
+ln -s ~/flipauth/flipauth ~/.local/bin/codex-switch
 ```
+
+验证安装是否成功：
+
+```sh
+flipauth claude doctor
+```
+
+如果 shell 提示 `command not found`，说明 `~/.local/bin` 不在你的 `PATH` 里。把
+`export PATH="$HOME/.local/bin:$PATH"` 加进 `~/.bashrc`（或 `~/.zshrc`），然后重开
+一个终端。这里不建议用 `~/bin`：Debian/Ubuntu 默认的 `~/.profile` 只在登录时该目录
+已存在的情况下才会把它加入 `PATH`，所以刚创建的 `~/bin` 要等下次登录才会生效。
 
 ## 快速上手
 
