@@ -197,6 +197,144 @@ printf '{"claudeAiOauth":{"accessToken":"fixture-token-gamma-DO-NOT-LEAK"}}' > "
 STATUS="$("$BIN_DIR/claude-switch" status)"
 check "uncached profile still appears in the block" bash -c "printf '%s' \"\$0\" | grep -q 'gamma .*no sample'" "$STATUS"
 
+# ---------- 11. observe: the free statusLine feed ----------
+OB="$TMP/observe"; mkdir -p "$OB"
+OCL="$OB/claude"; mkdir -p "$OCL"
+CACHE2="$OCL/oauth-accounts/.quota-cache.json"
+obs() { CLAUDE_SWITCH_CLAUDE_DIR="$OCL" "$BIN_DIR/claude-switch" observe; }
+ostatus() { CLAUDE_SWITCH_CLAUDE_DIR="$OCL" "$BIN_DIR/claude-switch" status; }
+ojson() { CLAUDE_SWITCH_CLAUDE_DIR="$OCL" "$BIN_DIR/claude-switch" status --json; }
+# payload <5h pct> <5h offset secs> <7d pct> <7d offset secs>
+payload() {
+  python3 - "$@" <<'PY'
+import json, sys, time
+now = time.time()
+print(json.dumps({"model": {"id": "x"}, "rate_limits": {
+    "five_hour": {"used_percentage": float(sys.argv[1]), "resets_at": now + float(sys.argv[2])},
+    "seven_day": {"used_percentage": float(sys.argv[3]), "resets_at": now + float(sys.argv[4])}}}))
+PY
+}
+entry_field() { python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['profiles'][sys.argv[2]].get(sys.argv[3]))" "$CACHE2" "$1" "$2"; }
+
+printf '{"claudeAiOauth":{"accessToken":"%s"}}' "$TOKEN_A" > "$OCL/.credentials.json"
+CLAUDE_SWITCH_CLAUDE_DIR="$OCL" "$BIN_DIR/claude-switch" save alpha >/dev/null
+printf '{"claudeAiOauth":{"accessToken":"%s"}}' "$TOKEN_B" > "$OCL/.credentials.json"
+CLAUDE_SWITCH_CLAUDE_DIR="$OCL" "$BIN_DIR/claude-switch" save beta >/dev/null
+
+payload 37.4 11400 61 320000 | obs
+check "observe creates a cache entry for the active profile" bash -c "test \"\$(python3 -c \"import json;print('beta' in json.load(open('$CACHE2'))['profiles'])\")\" = True"
+check "observe entry is tagged as coming from the status line" bash -c "test \"\$(python3 -c \"import json;print(json.load(open('$CACHE2'))['profiles']['beta']['source'])\")\" = statusline"
+check "observed cache is mode 600" mode_is "$CACHE2" 600
+check "observe normalises the epoch reset to an ISO string" bash -c "python3 -c \"
+import json,datetime
+v=json.load(open('$CACHE2'))['profiles']['beta']['five_hour']['resets_at']
+assert isinstance(v,str), v
+datetime.datetime.fromisoformat(v)\""
+STATUS_OBS="$(ostatus)"
+check "observed utilization keeps the 0-100 scale in status" outputs "$STATUS_OBS" '≥37%'
+check "observe does not attribute to the inactive profile" bash -c "printf '%s' \"\$0\" | grep -q 'alpha .*no sample'" "$STATUS_OBS"
+
+# throttling: identical values inside the window must not rewrite the sample
+STAMP1="$(entry_field beta fetched_at)"
+sleep 1
+payload 37.4 11400 61 320000 | obs
+check "observe skips the write while values are unchanged and fresh" bash -c "test \"\$(python3 -c \"import json;print(json.load(open('$CACHE2'))['profiles']['beta']['fetched_at'])\")\" = '$STAMP1'"
+payload 41.0 11400 61 320000 | obs
+check "observe writes immediately when a value moves" bash -c "test \"\$(python3 -c \"import json;print(json.load(open('$CACHE2'))['profiles']['beta']['fetched_at'])\")\" != '$STAMP1'"
+STAMP2="$(entry_field beta fetched_at)"
+sleep 1
+OBSERVE_MIN_INTERVAL=0 payload 41.0 11400 61 320000 | OBSERVE_MIN_INTERVAL=0 CLAUDE_SWITCH_CLAUDE_DIR="$OCL" "$BIN_DIR/claude-switch" observe
+check "observe refreshes the sample age once the interval elapses" bash -c "test \"\$(python3 -c \"import json;print(json.load(open('$CACHE2'))['profiles']['beta']['fetched_at'])\")\" != '$STAMP2'"
+
+# malformed / absent inputs must be silent no-ops, never a broken status line
+cp "$CACHE2" "$TMP/before-bad.json"
+check "observe survives non-JSON stdin" bash -c "printf 'not json' | CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' observe"
+check "observe survives empty stdin" bash -c "printf '' | CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' observe"
+check "observe survives a payload with no rate_limits" bash -c "printf '{\"model\":{\"id\":\"x\"}}' | CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' observe"
+check "observe survives a payload with null windows" bash -c "printf '{\"rate_limits\":{\"five_hour\":null,\"seven_day\":null}}' | CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' observe"
+check "no bad payload altered the cache" cmp -s "$CACHE2" "$TMP/before-bad.json"
+check "observe writes nothing when no profile is active" bash -c "
+  D=\$(mktemp -d); mkdir -p \"\$D/oauth-accounts\"
+  printf '%s' '{\"claudeAiOauth\":{\"accessToken\":\"x\"}}' > \"\$D/oauth-accounts/solo.credentials.json\"
+  printf '{\"rate_limits\":{\"five_hour\":{\"used_percentage\":5,\"resets_at\":9999999999}}}' | CLAUDE_SWITCH_CLAUDE_DIR=\"\$D\" '$BIN_DIR/claude-switch' observe
+  ! test -f \"\$D/oauth-accounts/.quota-cache.json\""
+OBS_NOISE="$(payload 41 11400 61 320000 | obs 2>&1)"
+check "observe output is silent" test -z "$OBS_NOISE"
+check "observe never leaks a token" bash -c "! grep -q '$TOKEN_B' '$CACHE2'"
+check "codex observe is rejected" bash -c "! printf '{}' | \"$BIN_DIR/codex-switch\" observe 2>/dev/null"
+check "observe rejects extra arguments" bash -c "! printf '{}' | CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' observe extra 2>/dev/null"
+
+# observe and the networked quota command must share one cache, not fight over it
+python3 - "$CACHE2" <<'PY'
+import json, sys
+from datetime import datetime, timedelta, timezone
+p = sys.argv[1]; c = json.load(open(p))
+c["profiles"]["alpha"] = {"fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                          "source": "snapshot",
+                          "five_hour": {"utilization": 9.0,
+                                        "resets_at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()}}
+json.dump(c, open(p, "w"))
+PY
+payload 44.0 11400 61 320000 | obs
+check "observe preserves an entry written by the quota command" bash -c "test \"\$(python3 -c \"import json;print(json.load(open('$CACHE2'))['profiles']['alpha']['source'])\")\" = snapshot"
+check "status renders both sources together" bash -c "printf '%s' \"\$0\" | grep -q '≥9%'" "$(ostatus)"
+
+# ---------- 12. status --json ----------
+BEFORE_JSON="$(requests_seen)"
+JSON_OUT="$(ojson)"
+check "--json emits parseable JSON" bash -c "printf '%s' \"\$0\" | python3 -c 'import json,sys;json.load(sys.stdin)'" "$JSON_OUT"
+check "--json reports the active profile" bash -c "test \"\$(printf '%s' \"\$0\" | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"active_profile\"])')\" = beta" "$JSON_OUT"
+check "--json names the value a lower bound" outputs "$JSON_OUT" 'utilization_at_least'
+check "--json reports cache state ok" bash -c "test \"\$(printf '%s' \"\$0\" | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"cache\"][\"state\"])')\" = ok" "$JSON_OUT"
+check "--json makes no request to the stub" test "$(requests_seen)" = "$BEFORE_JSON"
+check "--json rejects further arguments" bash -c "! CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' status --json extra 2>/dev/null"
+check "status rejects unknown options" bash -c "! CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' status --nope 2>/dev/null"
+check "--json marks an expired window rather than reporting a number" bash -c "
+  D=\$(mktemp -d); mkdir -p \"\$D/oauth-accounts\"
+  printf '%s' '{\"claudeAiOauth\":{\"accessToken\":\"x\"}}' > \"\$D/oauth-accounts/solo.credentials.json\"
+  printf 'solo\n' > \"\$D/oauth-accounts/.active-profile\"
+  printf '{\"rate_limits\":{\"five_hour\":{\"used_percentage\":88,\"resets_at\":1}}}' | CLAUDE_SWITCH_CLAUDE_DIR=\"\$D\" '$BIN_DIR/claude-switch' observe
+  CLAUDE_SWITCH_CLAUDE_DIR=\"\$D\" '$BIN_DIR/claude-switch' status --json | python3 -c \"
+import json,sys
+w=json.load(sys.stdin)['profiles'][0]['quota']['five_hour']
+raise SystemExit(0 if w['state']=='expired' and w['utilization_at_least'] is None else 1)\""
+check "--json gives an unsampled profile a null quota" bash -c "printf '%s' \"\$0\" | python3 -c \"
+import json,sys
+rows={r['name']:r for r in json.load(sys.stdin)['profiles']}
+raise SystemExit(0 if 'quota' in rows['beta'] else 1)\"" "$JSON_OUT"
+check "--json flags a corrupt cache instead of dying" bash -c "
+  cp '$CACHE2' '$TMP/ob.bak'; printf 'garbage' > '$CACHE2'
+  CLAUDE_SWITCH_CLAUDE_DIR='$OCL' '$BIN_DIR/claude-switch' status --json | python3 -c \"
+import json,sys
+d=json.load(sys.stdin)
+raise SystemExit(0 if d['cache']['state']=='unreadable' and d['profiles'] else 1)\"
+  rc=\$?; cp '$TMP/ob.bak' '$CACHE2'; exit \$rc"
+CODEX_JSON="$("$BIN_DIR/codex-switch" status --json)"
+check "codex --json omits the quota key entirely" bash -c "printf '%s' \"\$0\" | python3 -c \"
+import json,sys
+d=json.load(sys.stdin)
+raise SystemExit(0 if 'cache' not in d and all('quota' not in r for r in d['profiles']) else 1)\"" "$CODEX_JSON"
+
+# ---------- 13. the two renderings must not drift apart ----------
+check "text and --json agree on every profile" bash -c "
+python3 - \"\$0\" \"\$1\" <<'PY'
+import json, re, sys
+text, doc = sys.argv[1], json.loads(sys.argv[2])
+for row in doc['profiles']:
+    line = next((l for l in text.splitlines() if re.match(r'^[* ] ' + re.escape(row['name']) + r'\b', l)), None)
+    assert line is not None, f\"{row['name']} missing from text output\"
+    q = row.get('quota')
+    if q is None:
+        assert 'no sample' in line, line
+        continue
+    for key in ('five_hour', 'seven_day'):
+        w = q[key]
+        if w['state'] == 'known':
+            assert f\"≥{w['utilization_at_least']:.0f}%\" in line, (key, line)
+        else:
+            assert 'unknown' in line, (key, line)
+PY" "$(ostatus)" "$JSON_OUT"
+
 echo "----"
 if [[ "$fails" -gt 0 ]]; then echo "$fails check(s) failed"; exit 1; fi
 echo "all claude-quota-cache checks passed"

@@ -58,10 +58,11 @@ usage() {
 Usage:
   $PROG save <profile>
   $PROG <profile>
-  $PROG status
+  $PROG status [--json]
   $PROG doctor
 USAGE
   [[ "$SERVICE" == claude ]] && printf '  %s quota [profile]\n' "$PROG"
+  [[ "$SERVICE" == claude ]] && printf '  %s observe            (reads a statusLine JSON payload on stdin)\n' "$PROG"
   [[ "$SERVICE" == claude ]] && printf '  %s login <profile> [claude auth login options]\n' "$PROG"
   return 0
 }
@@ -217,6 +218,95 @@ cmd_status() {
     [[ "$SERVICE" == claude ]] && { status_quota_claude || true; }
   fi
   return 0
+}
+
+# Machine-readable `status`, for callers that must decide which profile to hand work
+# to. Same data and the same offline guarantee as the text form; the field names carry
+# the semantics that the text form carries with "≥" and "unknown", so a consumer cannot
+# read a cached number as an exact one:
+#   utilization_at_least  a lower bound, never a measurement
+#   state                 known | expired | missing
+# Codex profiles carry no `quota` key at all — the field is absent rather than null,
+# because Codex has no usage endpoint, not because it is merely unsampled.
+cmd_status_json() {
+  python3 - "$SERVICE" "$STATE_DIR" "${SUFFIX[0]}" "$ACTIVE_MARKER" \
+           "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" <<'PY'
+import json, pathlib, sys
+from datetime import datetime, timezone
+
+service = sys.argv[1]; state_dir = pathlib.Path(sys.argv[2]); suffix = sys.argv[3]
+active_marker = pathlib.Path(sys.argv[4]); cache_path = pathlib.Path(sys.argv[5])
+schema = int(sys.argv[6])
+
+names = sorted(p.name[: -len("." + suffix)] for p in state_dir.glob("*." + suffix)) \
+    if state_dir.exists() else []
+
+active = None
+if active_marker.exists():
+    try:
+        active = active_marker.read_text(encoding="utf-8").strip() or None
+    except Exception:
+        active = None
+
+doc = {"service": service, "active_profile": active, "profiles": []}
+
+entries, cache_state = {}, "missing"
+if service == "claude":
+    if cache_path.exists():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                cache_state = "unreadable"
+            elif loaded.get("schema") != schema:
+                cache_state = "unsupported_schema"
+            elif not isinstance(loaded.get("profiles"), dict):
+                cache_state = "unreadable"
+            else:
+                entries, cache_state = loaded["profiles"], "ok"
+        except Exception:
+            cache_state = "unreadable"
+    doc["cache"] = {"state": cache_state}
+
+now = datetime.now(timezone.utc)
+
+def parse(iso):
+    if not isinstance(iso, str) or not iso: return None
+    try: dt = datetime.fromisoformat(iso)
+    except ValueError: return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+def window(entry, key):
+    w = entry.get(key)
+    if not isinstance(w, dict):
+        return {"state": "missing", "utilization_at_least": None, "resets_at": None}
+    util = w.get("utilization"); resets = parse(w.get("resets_at"))
+    raw_resets = w.get("resets_at") if isinstance(w.get("resets_at"), str) else None
+    if not isinstance(util, (int, float)) or isinstance(util, bool) or resets is None:
+        return {"state": "missing", "utilization_at_least": None, "resets_at": raw_resets}
+    if (resets - now).total_seconds() <= 0:
+        # The window rolled over after the sample; the old number describes nothing.
+        return {"state": "expired", "utilization_at_least": None, "resets_at": raw_resets}
+    return {"state": "known", "utilization_at_least": util, "resets_at": raw_resets}
+
+for name in names:
+    row = {"name": name, "active": name == active}
+    if service == "claude":
+        entry = entries.get(name)
+        if not isinstance(entry, dict):
+            row["quota"] = None
+        else:
+            fetched = parse(entry.get("fetched_at"))
+            row["quota"] = {
+                "sampled_at": entry.get("fetched_at") if isinstance(entry.get("fetched_at"), str) else None,
+                "age_seconds": int((now - fetched).total_seconds()) if fetched else None,
+                "source": entry.get("source") if isinstance(entry.get("source"), str) else None,
+                "five_hour": window(entry, "five_hour"),
+                "seven_day": window(entry, "seven_day"),
+            }
+    doc["profiles"].append(row)
+
+print(json.dumps(doc, indent=2, sort_keys=True))
+PY
 }
 
 cmd_login() {
@@ -506,6 +596,145 @@ print(f"* = active profile; refresh with '{hint}'")
 PY
 }
 
+# Record a rate-limit observation that Claude Code handed us for free.
+#
+# Claude Code pipes a JSON payload into the configured statusLine command on every
+# render, and for Claude.ai subscribers that payload already carries the same two
+# rolling windows the `quota` command pays a network request for. Hooking a single
+# line onto the end of an existing statusLine script therefore keeps the *active*
+# profile's cache continuously fresh at zero cost — and, more usefully, means that
+# when you switch away from a profile its last sample is from seconds earlier rather
+# than from whenever you last remembered to run `quota`.
+#
+# Two constraints follow from running inside a status line:
+#   - It must never fail loudly. A broken payload, a missing marker, or an unwritable
+#     cache all exit quietly; breaking someone's prompt to record telemetry is absurd.
+#   - It must not write on every render. Writes are skipped while the values are
+#     unchanged and the existing sample is under a minute old.
+#
+# Attribution note: the payload does not identify the account, so the observation is
+# filed under whatever `.active-profile` says. flipauth keeps that marker correct when
+# it performs the switch; a login performed outside flipauth can make it stale, and
+# there is no account identifier in Claude credentials to cross-check against.
+cmd_observe() {
+  [[ "$SERVICE" == claude ]] ||
+    fail "observe is Claude-only (it consumes a Claude Code statusLine payload); not supported for $SERVICE"
+  local payload
+  payload="$(cat 2>/dev/null || true)"
+  [[ -n "$payload" ]] || return 0
+  python3 - "$payload" "$ACTIVE_MARKER" "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" \
+           "${OBSERVE_MIN_INTERVAL:-60}" <<'PY' || true
+import json, os, pathlib, sys, tempfile
+from datetime import datetime, timezone
+
+payload_raw = sys.argv[1]; active_marker = pathlib.Path(sys.argv[2])
+cache_path = pathlib.Path(sys.argv[3]); schema = int(sys.argv[4])
+min_interval = float(sys.argv[5])
+
+def quit_quietly():
+    raise SystemExit(0)
+
+try:
+    payload = json.loads(payload_raw)
+except Exception:
+    quit_quietly()
+if not isinstance(payload, dict):
+    quit_quietly()
+
+limits = payload.get("rate_limits")
+if not isinstance(limits, dict):
+    quit_quietly()          # API-key users have no subscription windows
+
+try:
+    profile = active_marker.read_text(encoding="utf-8").strip()
+except Exception:
+    quit_quietly()
+if not profile:
+    quit_quietly()
+
+now = datetime.now(timezone.utc)
+
+# statusLine reports resets_at as a unix epoch; the usage endpoint reports ISO.
+# Normalise to ISO here so one cache never holds two time formats.
+def to_iso(value):
+    if isinstance(value, bool) or value is None: return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text: return None
+        try:
+            return datetime.fromtimestamp(float(text), timezone.utc).isoformat(timespec="seconds")
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat(timespec="seconds")
+    return None
+
+# Both sources express utilization on the same 0-100 scale, so the value is copied
+# straight across. Allow-listed, like every other cache write.
+def window(src):
+    if not isinstance(src, dict): return None
+    out = {}
+    used = src.get("used_percentage")
+    if isinstance(used, (int, float)) and not isinstance(used, bool):
+        out["utilization"] = used
+    resets = to_iso(src.get("resets_at"))
+    if resets: out["resets_at"] = resets
+    return out or None
+
+entry = {"fetched_at": now.isoformat(timespec="seconds"), "source": "statusline"}
+for key, src_key in (("five_hour", "five_hour"), ("seven_day", "seven_day")):
+    w = window(limits.get(src_key))
+    if w: entry[key] = w
+if "five_hour" not in entry and "seven_day" not in entry:
+    quit_quietly()
+
+kept = {}
+if cache_path.exists():
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+        if (isinstance(loaded, dict) and loaded.get("schema") == schema
+                and isinstance(loaded.get("profiles"), dict)):
+            kept = loaded["profiles"]
+    except Exception:
+        kept = {}
+
+# Skip the write while nothing has moved and the existing sample is still young.
+prev = kept.get(profile)
+if isinstance(prev, dict) and prev.get("source") == "statusline":
+    same = all(
+        (prev.get(k) or {}).get("utilization") == (entry.get(k) or {}).get("utilization")
+        for k in ("five_hour", "seven_day"))
+    if same:
+        try:
+            age = (now - datetime.fromisoformat(prev["fetched_at"])).total_seconds()
+        except Exception:
+            age = min_interval + 1
+        if age < min_interval:
+            quit_quietly()
+
+kept[profile] = entry
+tmp = None
+try:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(cache_path.parent), prefix=".quota-cache.")
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"schema": schema, "profiles": kept}, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, cache_path); tmp = None
+except Exception:
+    if tmp:
+        try: os.unlink(tmp)
+        except OSError: pass
+PY
+  return 0
+}
+
 # Query Anthropic's OAuth usage endpoint for each saved Claude profile and print
 # 5-hour / 7-day rolling-window utilization plus reset countdowns. This is the
 # only command that makes a network call; everything else is offline file work.
@@ -667,7 +896,13 @@ cmd_quota() {
 
 case "${1:-}" in
   save)   [[ "$#" -eq 2 ]] || fail "save requires exactly one profile name"; cmd_save "$2" ;;
-  status) [[ "$#" -eq 1 ]] || fail "status takes no extra arguments"; cmd_status ;;
+  status)
+    case "${2:-}" in
+      "")     [[ "$#" -eq 1 ]] || fail "status takes no extra arguments"; cmd_status ;;
+      --json) [[ "$#" -eq 2 ]] || fail "status --json takes no further arguments"; cmd_status_json ;;
+      *)      fail "status takes no arguments other than --json" ;;
+    esac ;;
+  observe) [[ "$#" -eq 1 ]] || fail "observe takes no arguments"; cmd_observe ;;
   doctor) [[ "$#" -eq 1 ]] || fail "doctor takes no extra arguments"; cmd_doctor ;;
   quota)  [[ "$#" -le 2 ]] || fail "quota takes an optional profile name"; cmd_quota "${2:-}" ;;
   login)  [[ "$#" -ge 2 ]] || fail "login requires a profile name"; p="$2"; shift 2; cmd_login "$p" "$@" ;;
