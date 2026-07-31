@@ -35,6 +35,7 @@ profile at once.
 - 📸 **Named snapshots** of each OAuth login, stored locally with strict `600`/`700` permissions.
 - 🔒 **Atomic, validated swaps** — credentials are shape-checked before every save and load, and written via temp-file-then-rename so a crash never leaves a half-written file.
 - 📊 **Quota at a glance** — see the 5-hour and 7-day usage windows (and reset countdowns) for **all** your Claude profiles side by side.
+- 🗂️ **Offline quota recall** — every live quota check is cached, so `status` can show each profile's last known usage without touching the network, even for profiles whose saved token has since expired.
 - 🩺 **`doctor` diagnostics** that fingerprint credentials and compare WSL vs. Windows-side Codex identity — without ever printing a raw token.
 - 🪪 **Login helper** for Claude that authenticates straight into a named profile.
 - 🧰 **Zero install footprint** — a single Bash script; the only requirements are `bash` and `python3`.
@@ -151,7 +152,8 @@ flipauth claude <profile>
 flipauth codex <profile>
 ```
 
-Show active profile and saved profiles:
+Show active profile and saved profiles. For Claude this also prints the last cached
+quota sample for each profile, entirely offline:
 
 ```sh
 flipauth claude status
@@ -241,6 +243,45 @@ their saved snapshot, so a profile whose saved token has expired shows
 has no equivalent endpoint. The endpoint is undocumented and may change. Avoid polling
 tighter than ~180s per account to stay clear of rate limiting.
 
+### Cached quota in `status`
+
+Every successful `quota` response is cached to `~/.claude/oauth-accounts/.quota-cache.json`
+(mode `600`, written atomically). Only the two rolling windows' utilization and reset
+time are stored, plus when the sample was taken and whether it came from the live
+credential file or a saved snapshot. Tokens are never cached.
+
+`flipauth claude status` then replays that cache with no network call at all:
+
+```text
+Active profile: production
+Saved profiles: production scratch staging
+
+Cached quota (offline snapshot, not live — a cached % is a lower bound):
+  Profile          5h    resets       7d    resets    sampled
+* production      ≥1%  in 3h19m     ≥14%   in 4d1h    12m ago
+  scratch     no sample
+  staging     unknown         —     ≥91%   in 2d4h  9h00m ago
+* = active profile; refresh with 'flipauth claude quota'
+```
+
+Read those numbers carefully — the display is deliberately pessimistic:
+
+- **`≥N%` is a lower bound, not a measurement.** Each window has a fixed reset time, so
+  usage can only have grown since the sample. A cached `≥88%` is enough to rule an
+  account out; a cached `≥1%` is *never* enough to conclude an account is free, because
+  a browser session, another machine, or another process may have spent it since.
+  Only a live `quota` call can justify starting an account.
+- **`unknown` means the window rolled over after the sample was taken.** The old
+  percentage describes an expired window and would be actively misleading, so it is
+  dropped rather than shown.
+- A profile with no cached sample shows `no sample`; a missing or unreadable cache
+  degrades to a one-line note and never affects `save`, `activate`, `doctor`, or the
+  active/saved lines above it.
+
+A failed `quota` call (expired token, rate limit, no network) leaves the last good
+sample in place instead of erasing it, and querying a single profile updates only that
+profile's entry.
+
 ## Windows-side Codex auth path
 
 `flipauth codex doctor` can compare the WSL credential against the Windows-side Codex
@@ -265,6 +306,8 @@ skipped.
 - `doctor` reports short hashes and token fingerprints, not raw tokens.
 - Activating a profile first re-saves the outgoing live credential, so an in-progress
   token refresh is never silently lost.
+- Successful quota responses are cached to `.quota-cache.json` in the same directory so
+  `status` stays offline; only quota-shaped fields are stored, never tokens.
 
 ## Environment variables
 
@@ -303,6 +346,7 @@ Basic local checks:
 bash -n ./flipauth          # syntax check
 ./tests/parity-test.sh      # save / activate / status / doctor coverage for both services
 ./tests/claude-doctor-test.sh   # doctor output + token-leak assertions
+./tests/claude-quota-cache-test.sh   # quota cache + offline status against a local stub
 ```
 
 ## License
@@ -339,6 +383,7 @@ MIT. See [`LICENSE`](LICENSE).
 - 📸 **命名快照**：本地保存每个 OAuth 登录，目录 `700`、文件 `600` 严格权限。
 - 🔒 **原子且经过校验的替换**：保存和加载前都会校验凭据结构，并采用「先写临时文件再重命名」的方式写入，崩溃也不会留下写了一半的文件。
 - 📊 **额度一目了然**：并排查看**所有** Claude 配置的 5 小时 / 7 天用量窗口及重置倒计时。
+- 🗂️ **离线额度回看**：每次实时额度查询都会写入缓存，`status` 因此可以不联网就展示每个配置最后一次已知用量 —— 即使该配置的快照 token 早已过期。
 - 🩺 **`doctor` 诊断**：对凭据做指纹比对，对照 WSL 与 Windows 侧的 Codex 身份 —— 全程不打印任何原始 token。
 - 🪪 **登录助手**：Claude 可直接登录并保存为命名配置。
 - 🧰 **零安装负担**：单个 Bash 脚本，仅依赖 `bash` 和 `python3`。
@@ -452,7 +497,7 @@ flipauth claude <profile>
 flipauth codex <profile>
 ```
 
-查看当前配置与已保存配置：
+查看当前配置与已保存配置。Claude 还会额外打印每个配置最后一次缓存的额度快照，全程离线：
 
 ```sh
 flipauth claude status
@@ -538,6 +583,40 @@ token 发送到 Anthropic 的 `/api/oauth/usage` 接口（即 Claude Code 的 `/
 对应接口。该接口未公开，可能随时变动。请勿对同一账号以快于约 180 秒的频率轮询，以免触发
 限流。
 
+### `status` 里的缓存额度
+
+每次成功的 `quota` 响应都会写入 `~/.claude/oauth-accounts/.quota-cache.json`（权限 `600`，
+原子写入）。缓存里只有两个滚动窗口的用量百分比与重置时间，外加采样时刻和该样本取自生效
+凭据文件还是保存的快照。**永远不缓存 token。**
+
+`flipauth claude status` 随后完全不联网地回放这份缓存：
+
+```text
+Active profile: production
+Saved profiles: production scratch staging
+
+Cached quota (offline snapshot, not live — a cached % is a lower bound):
+  Profile          5h    resets       7d    resets    sampled
+* production      ≥1%  in 3h19m     ≥14%   in 4d1h    12m ago
+  scratch     no sample
+  staging     unknown         —     ≥91%   in 2d4h  9h00m ago
+* = active profile; refresh with 'flipauth claude quota'
+```
+
+这些数字要按字面读 —— 展示方式是刻意保守的：
+
+- **`≥N%` 是下界，不是测量值。** 每个窗口有固定的重置时刻，因此在同一窗口内用量只增不减。
+  缓存里的 `≥88%` 足以**排除**一个账号；缓存里的 `≥1%` **永远不足以**断定这个账号还空着 ——
+  浏览器会话、另一台机器或另一个进程都可能在采样之后把额度用掉了。只有实时 `quota` 查询
+  才能授权启动某个账号。
+- **`unknown` 表示该窗口在采样之后已经重置过。** 旧百分比描述的是一个已经作废的窗口，
+  与其误导不如不显示。
+- 没有缓存样本的配置显示 `no sample`；缓存缺失或损坏时只降级成一行说明，绝不影响
+  `save`、`activate`、`doctor`，也不影响它上方的当前配置与已保存配置两行。
+
+失败的 `quota` 查询（token 过期、限流、断网）会保留上一次成功的样本而不是抹掉它；
+只查询单个配置时也只更新该配置的条目。
+
 ## Windows 侧 Codex 凭据路径
 
 `flipauth codex doctor` 可以把 WSL 侧凭据与 Windows 侧 Codex 的 `auth.json` 做对比，
@@ -560,6 +639,7 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 - 保存或加载前都会校验凭据 JSON 结构。
 - `doctor` 只报告短哈希和 token 指纹，不输出原始 token。
 - 激活配置时会先把即将切走的生效凭据重新保存，因此进行中的 token 刷新不会被悄悄丢失。
+- 成功的额度查询会缓存到同目录下的 `.quota-cache.json`，让 `status` 保持离线；缓存里只有额度相关字段，不含 token。
 
 ## 环境变量
 
@@ -597,6 +677,7 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 bash -n ./flipauth          # 语法检查
 ./tests/parity-test.sh      # 两个服务的 save / activate / status / doctor 覆盖
 ./tests/claude-doctor-test.sh   # doctor 输出与 token 不泄露断言
+./tests/claude-quota-cache-test.sh   # 针对本地 stub 的额度缓存与离线 status 覆盖
 ```
 
 ## 许可证
