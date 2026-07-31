@@ -36,6 +36,8 @@ profile at once.
 - 🔒 **Atomic, validated swaps** — credentials are shape-checked before every save and load, and written via temp-file-then-rename so a crash never leaves a half-written file.
 - 📊 **Quota at a glance** — see the 5-hour and 7-day usage windows (and reset countdowns) for **all** your Claude profiles side by side.
 - 🗂️ **Offline quota recall** — every live quota check is cached, so `status` can show each profile's last known usage without touching the network, even for profiles whose saved token has since expired.
+- 🔌 **Free, continuous refresh** — hook `observe` onto your Claude Code status line and the active profile's cache stays current from data Claude Code already gives you, with no network request and no extra cost.
+- 🤖 **`status --json`** for scripts and agents that must pick a profile before dispatching work.
 - 🩺 **`doctor` diagnostics** that fingerprint credentials and compare WSL vs. Windows-side Codex identity — without ever printing a raw token.
 - 🪪 **Login helper** for Claude that authenticates straight into a named profile.
 - 🧰 **Zero install footprint** — a single Bash script; the only requirements are `bash` and `python3`.
@@ -160,6 +162,19 @@ flipauth claude status
 flipauth codex status
 ```
 
+The same data as machine-readable JSON, for scripts and agents:
+
+```sh
+flipauth claude status --json
+```
+
+Record a rate-limit sample that Claude Code handed you for free (see *Free refresh from
+the status line* below):
+
+```sh
+flipauth claude observe   # reads a Claude Code statusLine payload on stdin
+```
+
 Diagnose local credential state:
 
 ```sh
@@ -282,6 +297,69 @@ A failed `quota` call (expired token, rate limit, no network) leaves the last go
 sample in place instead of erasing it, and querying a single profile updates only that
 profile's entry.
 
+### Free refresh from the status line
+
+`quota` costs a network request, so the cache is only as fresh as the last time you
+remembered to run it. Claude Code, however, already hands the same two rolling windows to
+your configured `statusLine` command on every render. `observe` catches that payload:
+
+```sh
+# at the end of your statusLine script, after you have read stdin into "$input"
+printf '%s' "$input" | flipauth claude observe
+```
+
+If your script consumes stdin with `input=$(cat)` — the usual pattern — pipe that
+variable, not stdin again.
+
+The result is that the **active** profile's sample is always seconds old, for free. That
+matters most for the profile you are about to leave: when you switch away, its cached
+number is from just before the switch rather than from whenever you last ran `quota`.
+`observe` and `quota` share one cache and merge into it, so you can use either or both.
+
+Three things worth knowing:
+
+- **It is silent and cheap by design.** Bad JSON, an absent `rate_limits` block (API-key
+  users have no subscription windows), or an unwritable cache all exit quietly — breaking
+  someone's shell prompt to record telemetry would be absurd. Writes are skipped while
+  the values are unchanged and the sample is under a minute old
+  (`OBSERVE_MIN_INTERVAL` overrides the interval).
+- **Attribution follows `.active-profile`.** The status-line payload does not identify
+  the account, so the sample is filed under whichever profile flipauth believes is
+  active. flipauth keeps that correct when *it* performs the switch; a login performed
+  outside flipauth can make it stale, and Claude credentials carry no account identifier
+  to cross-check against.
+- **Claude only.** Codex's status line is a built-in config list rather than a script, so
+  there is nowhere to hook; `flipauth codex observe` is rejected.
+
+### `status --json`
+
+For scripts and agents that must choose a profile before handing it work. Strictly
+offline, same data as the text form:
+
+```json
+{
+  "service": "claude",
+  "active_profile": "production",
+  "cache": { "state": "ok" },
+  "profiles": [
+    { "name": "production", "active": true,
+      "quota": {
+        "sampled_at": "2026-07-31T08:47:32+00:00", "age_seconds": 12, "source": "statusline",
+        "five_hour": { "state": "known",   "utilization_at_least": 37.4, "resets_at": "..." },
+        "seven_day": { "state": "expired", "utilization_at_least": null, "resets_at": "..." }
+      } },
+    { "name": "scratch", "active": false, "quota": null }
+  ]
+}
+```
+
+The field names carry the same warning the text form carries with `≥` and `unknown`:
+`utilization_at_least` is a **lower bound, never a measurement**, and `state` is one of
+`known` / `expired` / `missing`. `cache.state` (`ok` / `missing` / `unreadable` /
+`unsupported_schema`) lets a consumer tell "no data" apart from "broken". Codex profiles
+carry no `quota` key at all — absent rather than null, because Codex has no usage
+endpoint, not because it is merely unsampled.
+
 ## Windows-side Codex auth path
 
 `flipauth codex doctor` can compare the WSL credential against the Windows-side Codex
@@ -308,6 +386,8 @@ skipped.
   token refresh is never silently lost.
 - Successful quota responses are cached to `.quota-cache.json` in the same directory so
   `status` stays offline; only quota-shaped fields are stored, never tokens.
+- `observe` writes to that same cache from the payload Claude Code already pipes to your
+  status line, so keeping it fresh costs no network request at all.
 
 ## Environment variables
 
@@ -346,7 +426,7 @@ Basic local checks:
 bash -n ./flipauth          # syntax check
 ./tests/parity-test.sh      # save / activate / status / doctor coverage for both services
 ./tests/claude-doctor-test.sh   # doctor output + token-leak assertions
-./tests/claude-quota-cache-test.sh   # quota cache + offline status against a local stub
+./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (local stub, no network)
 ```
 
 ## License
@@ -384,6 +464,8 @@ MIT. See [`LICENSE`](LICENSE).
 - 🔒 **原子且经过校验的替换**：保存和加载前都会校验凭据结构，并采用「先写临时文件再重命名」的方式写入，崩溃也不会留下写了一半的文件。
 - 📊 **额度一目了然**：并排查看**所有** Claude 配置的 5 小时 / 7 天用量窗口及重置倒计时。
 - 🗂️ **离线额度回看**：每次实时额度查询都会写入缓存，`status` 因此可以不联网就展示每个配置最后一次已知用量 —— 即使该配置的快照 token 早已过期。
+- 🔌 **免费持续刷新**：把 `observe` 接到 Claude Code 的状态栏上，当前配置的缓存就会用 Claude Code 本来就给你的数据保持最新 —— 零网络请求，零成本。
+- 🤖 **`status --json`**：给需要在派发任务前先选账号的脚本和 agent 用。
 - 🩺 **`doctor` 诊断**：对凭据做指纹比对，对照 WSL 与 Windows 侧的 Codex 身份 —— 全程不打印任何原始 token。
 - 🪪 **登录助手**：Claude 可直接登录并保存为命名配置。
 - 🧰 **零安装负担**：单个 Bash 脚本，仅依赖 `bash` 和 `python3`。
@@ -504,6 +586,18 @@ flipauth claude status
 flipauth codex status
 ```
 
+同样的数据，机器可读格式，供脚本和 agent 使用：
+
+```sh
+flipauth claude status --json
+```
+
+记录一次 Claude Code 免费交给你的额度采样（见下方「从状态栏免费刷新」）：
+
+```sh
+flipauth claude observe   # 从 stdin 读取 Claude Code 的 statusLine 载荷
+```
+
 诊断本地凭据状态：
 
 ```sh
@@ -617,6 +711,62 @@ Cached quota (offline snapshot, not live — a cached % is a lower bound):
 失败的 `quota` 查询（token 过期、限流、断网）会保留上一次成功的样本而不是抹掉它；
 只查询单个配置时也只更新该配置的条目。
 
+### 从状态栏免费刷新
+
+`quota` 要发一次网络请求，所以缓存的新鲜度取决于你还记不记得跑它。但 Claude Code 每次
+渲染状态栏时，**本来就把同样这两个滚动窗口交给了你配置的 `statusLine` 命令**。`observe`
+把这份载荷接住：
+
+```sh
+# 在你的 statusLine 脚本末尾，在已经把 stdin 读进 "$input" 之后
+printf '%s' "$input" | flipauth claude observe
+```
+
+如果你的脚本用 `input=$(cat)` 读取 stdin（常见写法），请把这个变量管道过去，不要再读一次
+stdin。
+
+效果是：**当前配置**的样本永远只有几秒钟大，而且免费。这一点对你**即将切走**的那个配置
+最有价值 —— 切换之后，它的缓存数字来自切换前一刻，而不是你上次想起来跑 `quota` 的时候。
+`observe` 和 `quota` 共用同一份缓存并合并写入，两者可以只用一个，也可以都用。
+
+三件需要知道的事：
+
+- **它被设计成安静且廉价。** JSON 损坏、载荷里没有 `rate_limits`（API key 用户没有订阅
+  窗口）、缓存写不进去 —— 全都安静退出。为了记一条遥测而弄坏别人的 shell 提示符是荒唐的。
+  数值没变且样本不到一分钟时会跳过写入（`OBSERVE_MIN_INTERVAL` 可覆盖该间隔）。
+- **归属依据是 `.active-profile`。** 状态栏载荷**不包含账号身份**，所以样本会记在 flipauth
+  认为当前生效的那个配置名下。flipauth 自己执行切换时这个标记是准的；绕过 flipauth 重新
+  登录会让它过时，而 Claude 凭据里没有任何账号标识可供交叉验证。
+- **仅限 Claude。** Codex 的状态栏是内置配置项而非可执行脚本，没有地方挂钩子；
+  `flipauth codex observe` 会被拒绝。
+
+### `status --json`
+
+给需要在派发任务前选定配置的脚本和 agent 使用。严格离线，数据与文本形式一致：
+
+```json
+{
+  "service": "claude",
+  "active_profile": "production",
+  "cache": { "state": "ok" },
+  "profiles": [
+    { "name": "production", "active": true,
+      "quota": {
+        "sampled_at": "2026-07-31T08:47:32+00:00", "age_seconds": 12, "source": "statusline",
+        "five_hour": { "state": "known",   "utilization_at_least": 37.4, "resets_at": "..." },
+        "seven_day": { "state": "expired", "utilization_at_least": null, "resets_at": "..." }
+      } },
+    { "name": "scratch", "active": false, "quota": null }
+  ]
+}
+```
+
+字段名承载了文本形式用 `≥` 和 `unknown` 承载的同一个警告：`utilization_at_least` 是
+**下界，不是测量值**；`state` 取 `known` / `expired` / `missing`。`cache.state`
+（`ok` / `missing` / `unreadable` / `unsupported_schema`）让调用方能区分「没有数据」和
+「坏了」。Codex 的配置项**完全没有 `quota` 键** —— 是缺失而不是 null，因为 Codex 根本没有
+用量接口，不是「只是还没采样」。
+
 ## Windows 侧 Codex 凭据路径
 
 `flipauth codex doctor` 可以把 WSL 侧凭据与 Windows 侧 Codex 的 `auth.json` 做对比，
@@ -640,6 +790,7 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 - `doctor` 只报告短哈希和 token 指纹，不输出原始 token。
 - 激活配置时会先把即将切走的生效凭据重新保存，因此进行中的 token 刷新不会被悄悄丢失。
 - 成功的额度查询会缓存到同目录下的 `.quota-cache.json`，让 `status` 保持离线；缓存里只有额度相关字段，不含 token。
+- `observe` 从 Claude Code 本来就管道给状态栏的载荷里写进同一份缓存，因此保持新鲜完全不需要网络请求。
 
 ## 环境变量
 
@@ -677,7 +828,7 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 bash -n ./flipauth          # 语法检查
 ./tests/parity-test.sh      # 两个服务的 save / activate / status / doctor 覆盖
 ./tests/claude-doctor-test.sh   # doctor 输出与 token 不泄露断言
-./tests/claude-quota-cache-test.sh   # 针对本地 stub 的额度缓存与离线 status 覆盖
+./tests/claude-quota-cache-test.sh   # 额度缓存、observe、status --json（本地 stub，不联网）
 ```
 
 ## 许可证

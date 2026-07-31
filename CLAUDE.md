@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-`flipauth` is a single self-contained Bash script (`./flipauth`, ~670 lines) that swaps
+`flipauth` is a single self-contained Bash script (`./flipauth`, ~910 lines) that swaps
 saved OAuth login profiles for the official Claude Code CLI and the official Codex CLI.
 There is no build step, no dependencies to install, and no package manifest — the only
 runtime requirements are `bash` and `python3` (used for JSON validation and credential
@@ -14,8 +14,7 @@ inspection). Target platform is Windows WSL only.
 
 `tasks/todo.md` is the control plane — open work, and deferred work with the reason it
 was deferred. Read it before starting, so a decision that was already made deliberately
-does not get re-litigated. `docs/` holds specs for proposed-but-unimplemented work;
-a spec there is a proposal under review, not a description of the code.
+does not get re-litigated.
 
 ## Commands
 
@@ -23,13 +22,15 @@ a spec there is a proposal under review, not a description of the code.
 bash -n ./flipauth          # syntax check (lint equivalent)
 ./tests/parity-test.sh      # full save/activate/status/doctor coverage for both services
 ./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
-./tests/claude-quota-cache-test.sh   # quota cache + offline cached-quota status
+./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (78 checks)
 ```
 
 `quota` is the one command that hits the network. `claude-quota-cache-test.sh` covers
 it offline by starting a local `http.server` stub and pointing `CLAUDE_SWITCH_API_BASE`
-at it, which also lets it drive 401/429/connection-failure paths deterministically.
-Only a real end-to-end check against Anthropic still needs a live token.
+at it, which also lets it drive 401/429/connection-failure paths deterministically. It
+also asserts that `status`, `status --json`, and `observe` issue no request at all — the
+stub's request log is compared before and after. Only a real end-to-end check against
+Anthropic still needs a live token.
 
 Run a single test by invoking its script directly — tests are plain Bash with a `check`
 helper, not a framework. They drive the real script in an isolated `mktemp -d` sandbox by
@@ -99,6 +100,32 @@ invariants are load-bearing and all four have tests:
 Degradation is one-directional: a missing, corrupt, or unknown-schema cache prints a
 single note and leaves the active/saved lines — and `save`/`activate`/`doctor` — intact.
 Codex's `status` never renders this block.
+
+**Two writers feed one cache; `observe` is the cheap one.** `quota` pays a network
+request. `observe` reads a Claude Code statusLine payload on stdin — Claude Code already
+hands the same two windows to the configured status-line command on every render — and
+writes the same schema-1 entries with `source: "statusline"`. Consequences worth keeping:
+
+- The two writers duplicate the merge-and-atomically-write logic in separate Python
+  heredocs. They must stay format-compatible; the test suite asserts a cache written by
+  one is read and merged by the other, which is the guard that actually matters.
+- `observe` runs inside a shell prompt, so it is **silent on every failure** and skips
+  writes while values are unchanged and the sample is under `OBSERVE_MIN_INTERVAL`
+  seconds old. Never make it print, prompt, or exit non-zero on bad input.
+- statusLine reports `resets_at` as a unix epoch and `used_percentage` on the same 0-100
+  scale as the endpoint's `utilization`. `observe` normalises the timestamp to ISO so one
+  cache never holds two time formats.
+- Attribution is by `.active-profile` alone. The payload carries no account identity and
+  Claude credentials carry no account identifier, so there is deliberately **no
+  cross-check** — do not invent one from the credential file hash, which changes on every
+  token refresh and would only produce false alarms.
+
+**`status --json` must agree with the text form.** It is a second rendering of the same
+cache, so the lower-bound and expired-window semantics are carried in the field names:
+`utilization_at_least` (never `utilization`) and `state` ∈ `known`/`expired`/`missing`.
+Codex rows omit `quota` entirely rather than setting it null — absent because there is no
+endpoint, not because it is unsampled. A test asserts the two renderings agree on every
+profile; that test is the reason the duplicated window logic is safe to keep.
 
 **Doctor inspects without leaking.** `doctor` is a Python heredoc per service. It reports
 file modes, sizes, and `sha16` hashes — never raw tokens. For Codex it decodes the JWT
