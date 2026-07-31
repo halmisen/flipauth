@@ -10,6 +10,13 @@ There is no build step, no dependencies to install, and no package manifest — 
 runtime requirements are `bash` and `python3` (used for JSON validation and credential
 inspection). Target platform is Windows WSL only.
 
+## Read first
+
+`tasks/todo.md` is the control plane — open work, and deferred work with the reason it
+was deferred. Read it before starting, so a decision that was already made deliberately
+does not get re-litigated. `docs/` holds specs for proposed-but-unimplemented work;
+a spec there is a proposal under review, not a description of the code.
+
 ## Commands
 
 ```sh
