@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-`flipauth` is a single self-contained Bash script (`./flipauth`, ~385 lines) that swaps
+`flipauth` is a single self-contained Bash script (`./flipauth`, ~670 lines) that swaps
 saved OAuth login profiles for the official Claude Code CLI and the official Codex CLI.
 There is no build step, no dependencies to install, and no package manifest — the only
 runtime requirements are `bash` and `python3` (used for JSON validation and credential
@@ -16,11 +16,13 @@ inspection). Target platform is Windows WSL only.
 bash -n ./flipauth          # syntax check (lint equivalent)
 ./tests/parity-test.sh      # full save/activate/status/doctor coverage for both services
 ./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
+./tests/claude-quota-cache-test.sh   # quota cache + offline cached-quota status
 ```
 
-Note `quota` is the one command that hits the network, so it has no offline unit
-test; verify it manually against a live token, or point `CLAUDE_SWITCH_API_BASE`
-at a stub. Its codex-rejection and profile-name validation paths are offline.
+`quota` is the one command that hits the network. `claude-quota-cache-test.sh` covers
+it offline by starting a local `http.server` stub and pointing `CLAUDE_SWITCH_API_BASE`
+at it, which also lets it drive 401/429/connection-failure paths deterministically.
+Only a real end-to-end check against Anthropic still needs a live token.
 
 Run a single test by invoking its script directly — tests are plain Bash with a `check`
 helper, not a framework. They drive the real script in an isolated `mktemp -d` sandbox by
@@ -67,6 +69,29 @@ The active profile uses the live credential file (freshest token); others use th
 saved snapshot and degrade to `token expired — re-activate` on 401. Codex has no
 equivalent endpoint, so `cmd_quota` hard-fails for it. Keep it opt-in and
 non-fatal — `quota` must never make `status`/`save`/`activate` depend on the network.
+
+**The quota cache separates observation from authorisation.** Every successful usage
+response is merged into `$STATE_DIR/.quota-cache.json` (schema `1`, mode `600`, atomic
+`mkstemp` + `os.replace`), and `cmd_status` replays it with zero network calls. Four
+invariants are load-bearing and all four have tests:
+
+1. *Allow-list, not filter.* `sample_of` builds the entry field by field — `fetched_at`,
+   `source`, and each window's `utilization`/`resets_at`. Never copy the raw response
+   through; a token must not be able to reach the cache by being added upstream.
+2. *Merge, never replace.* A single-profile query updates only that profile's entry, and
+   `write_cache` is a no-op when nothing succeeded, so a 401/429/offline run preserves
+   the last good sample instead of erasing it.
+3. *A cached percentage is a lower bound, printed as `≥N%`.* Windows have fixed reset
+   times, so usage can only have grown since the sample. This is enough to rule an
+   account out and never enough to authorise starting one — only a live `quota` call can
+   do that. Do not "improve" this into a bare `N%`.
+4. *An expired window is `unknown`, not a stale number.* If `resets_at` has passed (or
+   is missing/unparseable), the window degrades to `unknown` / `—`. Showing the old
+   percentage would be actively misleading.
+
+Degradation is one-directional: a missing, corrupt, or unknown-schema cache prints a
+single note and leaves the active/saved lines — and `save`/`activate`/`doctor` — intact.
+Codex's `status` never renders this block.
 
 **Doctor inspects without leaking.** `doctor` is a Python heredoc per service. It reports
 file modes, sizes, and `sha16` hashes — never raw tokens. For Codex it decodes the JWT

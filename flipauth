@@ -48,6 +48,10 @@ else
 fi
 
 ACTIVE_MARKER="$STATE_DIR/.active-profile"
+# Claude-only: last successful /api/oauth/usage sample per profile. Quota-shaped
+# fields only — never tokens, headers, or unrelated response fields.
+QUOTA_CACHE="$STATE_DIR/.quota-cache.json"
+QUOTA_CACHE_SCHEMA=1
 
 usage() {
   cat <<USAGE
@@ -204,9 +208,15 @@ cmd_status() {
     shopt -s nullglob; files=("$STATE_DIR"/*."${SUFFIX[0]}"); shopt -u nullglob
   fi
   printf 'Saved profiles:'
-  if [[ "${#files[@]}" -eq 0 ]]; then printf ' none\n'; return; fi
-  for f in "${files[@]}"; do printf ' %s' "$(basename "$f" ".${SUFFIX[0]}")"; done
-  printf '\n'
+  if [[ "${#files[@]}" -eq 0 ]]; then printf ' none\n'
+  else
+    for f in "${files[@]}"; do printf ' %s' "$(basename "$f" ".${SUFFIX[0]}")"; done
+    printf '\n'
+    # The cached-quota block is decoration on top of status; it must never be able
+    # to fail the command (including being SIGPIPE'd by `status | head`).
+    [[ "$SERVICE" == claude ]] && { status_quota_claude || true; }
+  fi
+  return 0
 }
 
 cmd_login() {
@@ -388,6 +398,114 @@ _claude_user_agent() {
   printf 'claude-code/%s' "${ver:-2.1.181}"
 }
 
+# How the user would refresh the cache, phrased for the invocation name in use.
+_quota_hint() {
+  if [[ "$PROG" == flipauth ]]; then printf 'flipauth claude quota'; else printf '%s quota' "$PROG"; fi
+}
+
+# Render the cached quota block appended to `status`. Strictly offline: it reads
+# the cache file and nothing else. A cached utilization is a *lower bound* — the
+# rolling window it belongs to has a fixed reset time, so real usage can only
+# have grown since the sample. It is therefore printed as ">=N%", which is enough
+# to rule an account out but never enough to authorise starting one. Once that
+# reset time has passed the number says nothing at all, so the window degrades to
+# "unknown" rather than showing a stale percentage.
+status_quota_claude() {
+  python3 - "$STATE_DIR" "$QUOTA_CACHE" "$ACTIVE_MARKER" "$QUOTA_CACHE_SCHEMA" "$(_quota_hint)" <<'PY'
+import json, pathlib, signal, sys
+from datetime import datetime, timezone
+
+# `status | head` / `status | grep -q` closes stdout early. Die on SIGPIPE the way
+# an ordinary Unix filter does instead of dumping a BrokenPipeError traceback.
+try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError): pass
+
+state_dir = pathlib.Path(sys.argv[1]); cache_path = pathlib.Path(sys.argv[2])
+active_marker = pathlib.Path(sys.argv[3]); schema = int(sys.argv[4]); hint = sys.argv[5]
+
+profiles = sorted(p.name[: -len(".credentials.json")] for p in state_dir.glob("*.credentials.json"))
+if not profiles:
+    raise SystemExit(0)
+
+def no_samples():
+    print(f"Cached quota: no samples yet — run '{hint}'")
+    raise SystemExit(0)
+
+if not cache_path.exists():
+    no_samples()
+try:
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    if not isinstance(cache, dict):
+        raise ValueError("cache is not an object")
+except Exception:
+    print(f"Cached quota: unavailable (cache unreadable) — refresh with '{hint}'")
+    raise SystemExit(0)
+if cache.get("schema") != schema:
+    print(f"Cached quota: unavailable (unsupported cache schema) — refresh with '{hint}'")
+    raise SystemExit(0)
+entries = cache.get("profiles")
+if not isinstance(entries, dict) or not any(n in entries for n in profiles):
+    no_samples()
+
+active = ""
+if active_marker.exists():
+    try: active = active_marker.read_text(encoding="utf-8").strip()
+    except Exception: active = ""
+
+now = datetime.now(timezone.utc)
+
+def parse(iso):
+    if not isinstance(iso, str) or not iso: return None
+    try: dt = datetime.fromisoformat(iso)
+    except ValueError: return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+def span(secs):
+    d, rem = divmod(int(secs), 86400); h, rem = divmod(rem, 3600); m = rem // 60
+    if d: return f"{d}d{h}h"
+    if h: return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+def window(entry, key):
+    w = entry.get(key)
+    if not isinstance(w, dict): return "unknown", "—"
+    util = w.get("utilization"); resets = parse(w.get("resets_at"))
+    if not isinstance(util, (int, float)) or resets is None: return "unknown", "—"
+    secs = (resets - now).total_seconds()
+    if secs <= 0: return "unknown", "—"   # window rolled over; the sample is void
+    return f"≥{util:.0f}%", f"in {span(secs)}"
+
+def age(entry):
+    fetched = parse(entry.get("fetched_at"))
+    if fetched is None: return "?"
+    secs = (now - fetched).total_seconds()
+    if secs < 0: return "just now"
+    return "just now" if secs < 60 else f"{span(secs)} ago"
+
+rows = []
+for name in profiles:
+    mark = "*" if name == active else " "
+    entry = entries.get(name)
+    if not isinstance(entry, dict):
+        rows.append((mark, name, None)); continue
+    h5, h5r = window(entry, "five_hour")
+    d7, d7r = window(entry, "seven_day")
+    rows.append((mark, name, (h5, h5r, d7, d7r, age(entry))))
+
+w = max(len(r[1]) for r in rows + [("", "Profile", None)])
+print()
+print("Cached quota (offline snapshot, not live — a cached % is a lower bound):")
+print(f"  {'Profile':<{w}}  {'5h':>7}  {'resets':>8}  {'7d':>7}  {'resets':>8}  {'sampled':>9}")
+for mark, name, data in rows:
+    if data is None:
+        print(f"{mark} {name:<{w}}  no sample")
+    else:
+        h5, h5r, d7, d7r, when = data
+        print(f"{mark} {name:<{w}}  {h5:>7}  {h5r:>8}  {d7:>7}  {d7r:>8}  {when:>9}")
+print(f"* = active profile; refresh with '{hint}'")
+PY
+}
+
 # Query Anthropic's OAuth usage endpoint for each saved Claude profile and print
 # 5-hour / 7-day rolling-window utilization plus reset countdowns. This is the
 # only command that makes a network call; everything else is offline file work.
@@ -395,13 +513,15 @@ quota_claude() {
   local user_agent api_base want="${1:-}"
   user_agent="$(_claude_user_agent)"
   api_base="${CLAUDE_SWITCH_API_BASE:-https://api.anthropic.com}"
-  python3 - "$STATE_DIR" "$ACTIVE_MARKER" "${ACTIVE[0]}" "$user_agent" "$api_base" "$want" <<'PY'
-import json, pathlib, sys, urllib.request, urllib.error
+  python3 - "$STATE_DIR" "$ACTIVE_MARKER" "${ACTIVE[0]}" "$user_agent" "$api_base" "$want" \
+           "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" <<'PY'
+import json, os, pathlib, sys, tempfile, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 state_dir = pathlib.Path(sys.argv[1]); active_marker = pathlib.Path(sys.argv[2])
 live = pathlib.Path(sys.argv[3]); user_agent = sys.argv[4]
 api_base = sys.argv[5].rstrip("/"); want = sys.argv[6]
+cache_path = pathlib.Path(sys.argv[7]); cache_schema = int(sys.argv[8])
 
 active = ""
 if active_marker.exists():
@@ -458,6 +578,54 @@ def pct(window):
     return (f"{u:.0f}%" if isinstance(u, (int, float)) else "—",
             rel(window.get("resets_at")))
 
+# Build the cache entry for one successful response. Strictly allow-listed: only
+# the two rolling windows' utilization and reset time, plus when and from which
+# credential file the sample came. Tokens and any other response field are dropped.
+def sample_of(data, path):
+    def win(w):
+        if not isinstance(w, dict): return None
+        out = {}
+        if isinstance(w.get("utilization"), (int, float)): out["utilization"] = w["utilization"]
+        if isinstance(w.get("resets_at"), str): out["resets_at"] = w["resets_at"]
+        return out or None
+    entry = {"fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "source": "live" if path == live else "snapshot"}
+    for key in ("five_hour", "seven_day"):
+        w = win(data.get(key))
+        if w: entry[key] = w
+    return entry
+
+# Merge successful samples into the cache. Only profiles that answered are
+# touched, so a single-profile query never drops the others, and a run where
+# every profile failed leaves the last good samples in place.
+def write_cache(samples):
+    if not samples: return
+    kept = {}
+    if cache_path.exists():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (isinstance(loaded, dict) and loaded.get("schema") == cache_schema
+                    and isinstance(loaded.get("profiles"), dict)):
+                kept = loaded["profiles"]
+        except Exception:
+            kept = {}
+    kept.update(samples)
+    tmp = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(cache_path.parent), prefix=".quota-cache.")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"schema": cache_schema, "profiles": kept}, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, cache_path); tmp = None
+    except Exception as exc:
+        if tmp:
+            try: os.unlink(tmp)
+            except OSError: pass
+        print(f"note: quota cache not updated ({type(exc).__name__})", file=sys.stderr)
+
+samples = {}
 rows = []
 for name, path in profiles.items():
     mark = "*" if name == active else " "
@@ -472,9 +640,12 @@ for name, path in profiles.items():
         rows.append((mark, name, msg, "", "", "")); continue
     except Exception as e:
         rows.append((mark, name, f"error: {type(e).__name__}", "", "", "")); continue
+    samples[name] = sample_of(data, path)
     h5, h5r = pct(data.get("five_hour"))
     d7, d7r = pct(data.get("seven_day"))
     rows.append((mark, name, h5, h5r, d7, d7r))
+
+write_cache(samples)
 
 w = max(len(r[1]) for r in rows + [("", "Profile", "", "", "", "")])
 print(f"  {'Profile':<{w}}  {'5h':>5}  {'resets':>8}  {'7d':>5}  {'resets':>8}")
