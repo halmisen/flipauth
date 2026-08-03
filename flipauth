@@ -1060,8 +1060,12 @@ quota_codex() {
   bin="${CODEX_SWITCH_CODEX_BIN:-codex}"
   command -v "$bin" >/dev/null 2>&1 ||
     fail "codex command not found; set CODEX_SWITCH_CODEX_BIN to its path"
+  # Run the reader as a job so a signal aimed at flipauth reaches it. Without this the
+  # Python child is merely orphaned: it keeps querying — with a credential copy on disk —
+  # after the command the user killed has already exited.
+  local pid rc=0
   python3 - "$STATE_DIR" "$ACTIVE_MARKER" "${ACTIVE[0]}" "${ACTIVE[1]}" "$want" \
-           "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" "$bin" "${CODEX_SWITCH_QUOTA_TIMEOUT:-40}" <<'PY'
+           "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" "$bin" "${CODEX_SWITCH_QUOTA_TIMEOUT:-40}" <<'PY' &
 import json, os, pathlib, shutil, signal, subprocess, sys, tempfile, threading, time
 from datetime import datetime, timezone
 
@@ -1073,7 +1077,16 @@ TEMP_PREFIX = ".codex-quota-"
 #   - sweep anything an uncatchable kill (SIGKILL, power loss) stranded earlier.
 # The sweep only touches directories with this exact prefix that we own and that are
 # older than a concurrent run could plausibly be.
+# Bail out once and once only. A second signal arriving while the cleanup below is
+# still running would raise again from inside the `finally` and abort it *before* the
+# temp directory is removed — which is exactly the leak this handler exists to prevent.
+_bailing = False
+
 def _bail(signum, frame):
+    global _bailing
+    if _bailing:
+        return
+    _bailing = True
     raise SystemExit(128 + signum)
 
 for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -1330,6 +1343,11 @@ for _m, name, _e, data in rows:
         tail = f" (expires {when})" if when else ""
         print(f"Reset credits for {name}: {creds['available']} available{tail}")
 PY
+  pid=$!
+  trap "kill -TERM $pid 2>/dev/null" TERM INT HUP
+  wait "$pid" || rc=$?
+  trap - TERM INT HUP
+  return "$rc"
 }
 
 cmd_quota() {

@@ -23,7 +23,7 @@ bash -n ./flipauth          # syntax check (lint equivalent)
 ./tests/parity-test.sh      # full save/activate/status/doctor coverage for both services
 ./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
 ./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (79 checks)
-./tests/codex-quota-test.sh          # codex app-server quota path (57 checks, stubbed)
+./tests/codex-quota-test.sh          # codex app-server quota path (60 checks, stubbed)
 ```
 
 `quota` is the only command that reaches the network — for Claude over HTTP, for Codex by
@@ -135,11 +135,22 @@ There is no HTTP usage endpoint; the data is behind the JSON-RPC method
    of its snapshot (dir `700`, files `600`), and nothing is ever copied back. A query
    therefore cannot mutate a saved profile or activate an account. Tests assert the temp
    home is never the real Codex dir or the state dir. That copy is a real credential, so
-   it must not outlive the query: SIGTERM/SIGINT/SIGHUP are caught so the cleanup still
-   runs, and because SIGKILL cannot be caught, each run first sweeps `.codex-quota-*`
-   directories it owns that are older than five minutes. The five-minute floor is what
-   keeps the sweep from deleting a concurrent run's live directory — do not lower it
-   without changing that reasoning, and there are tests for both halves.
+   it must not outlive the query, and three separate things are needed to guarantee it:
+
+   - The Python reader runs as a **background job** with a bash `trap` forwarding
+     TERM/INT/HUP to it. Without that the child is merely orphaned when flipauth is
+     killed: it keeps querying, with the credential copy still on disk, after the command
+     the user killed has exited.
+   - The Python signal handler bails **once**. A second signal — and there usually is one,
+     since the shell forwards what it received — would otherwise raise again from inside
+     the `finally` and abort it *before* `rmtree`, stranding exactly the copy the handler
+     exists to remove. This was a real bug; the accompanying test sends two signals.
+   - SIGKILL cannot be caught, so each run first sweeps `.codex-quota-*` directories it
+     owns that are older than five minutes. That floor is what stops the sweep from
+     deleting a concurrent run's live directory — do not lower it without revisiting that.
+
+   Cleanup is not instantaneous: the app-server is terminated before its `CODEX_HOME` is
+   removed. Tests poll for the directory to drain rather than asserting on the same tick.
 2. *`account/chatgptAuthTokens/refresh` is a server→client request.* The app-server does
    not refresh tokens itself — it asks the connected client to do it and hand the new
    token back. flipauth **declines** it, so no rotation can happen on this path. A test

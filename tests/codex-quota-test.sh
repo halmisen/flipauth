@@ -137,13 +137,23 @@ check "no temp codex home was left behind" bash -c "! ls -d /tmp/.codex-quota-* 
 # both stay inside this test's sandbox.
 SB="$TMP/tmpdir"; mkdir -p "$SB"
 strays() { find "$SB" -maxdepth 1 -type d -name '.codex-quota-*' | wc -l; }
+# Cleanup cannot be instantaneous — the app-server is terminated before its CODEX_HOME
+# is removed — so wait for it rather than asserting on the same tick.
+drains() { local i; for i in $(seq 100); do [[ "$(strays)" == 0 ]] && return 0; sleep 0.1; done; return 1; }
 printf 'hang' > "$STUB_DIR/mode"
 TMPDIR="$SB" timeout -s TERM 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
-check "SIGTERM mid-query removes the temp credential copy" test "$(strays)" = 0
+check "SIGTERM mid-query removes the temp credential copy" drains
 TMPDIR="$SB" timeout -s INT 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
-check "SIGINT mid-query removes the temp credential copy" test "$(strays)" = 0
+check "SIGINT mid-query removes the temp credential copy" drains
+TMPDIR="$SB" timeout -s HUP 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
+check "SIGHUP mid-query removes the temp credential copy" drains
+# A second signal arriving during cleanup must not abort it before the directory goes.
+TMPDIR="$SB" bash -c '"$1" quota >/dev/null 2>&1 & p=$!; sleep 1; kill -TERM $p; kill -TERM $p; wait $p' _ "$BIN_DIR/codex-switch" >/dev/null 2>&1 || true
+check "a second signal during cleanup does not strand the copy" drains
 # SIGKILL cannot be caught, so the next run must sweep what it stranded.
-( TMPDIR="$SB" timeout -s KILL 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 ) 2>/dev/null || true
+# The kill notice is emitted by whichever shell owns the job, so run it in an inner
+# shell whose stderr is discarded; the suite must leave stderr clean.
+bash -c 'TMPDIR="$1" timeout -s KILL 1 "$2" quota >/dev/null 2>&1' _ "$SB" "$BIN_DIR/codex-switch" 2>/dev/null || true
 check "SIGKILL does strand a temp dir" bash -c "test \"\$(find '$SB' -maxdepth 1 -type d -name '.codex-quota-*' | wc -l)\" != 0"
 find "$SB" -maxdepth 1 -type d -name '.codex-quota-*' -exec touch -d '1 hour ago' {} \;
 printf 'ok' > "$STUB_DIR/mode"
