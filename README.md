@@ -254,8 +254,10 @@ utilization plus reset countdowns:
 
 The active profile (`*`) is read from the live credential file; other profiles use
 their saved snapshot, so a profile whose saved token has expired shows
-`token expired — re-activate` instead of a number. This is a Claude-only feature; Codex
-has no equivalent endpoint. The endpoint is undocumented and may change. Avoid polling
+`token expired — re-activate` instead of a number. This is a Claude-only feature: Codex
+is not implemented here. (Codex does report its own rate limits in its built-in status
+line, so the data exists upstream; flipauth simply does not read it yet.) The Anthropic
+endpoint is undocumented and may change. Avoid polling
 tighter than ~180s per account to stay clear of rate limiting.
 
 ### Cached quota in `status`
@@ -357,8 +359,8 @@ The field names carry the same warning the text form carries with `≥` and `unk
 `utilization_at_least` is a **lower bound, never a measurement**, and `state` is one of
 `known` / `expired` / `missing`. `cache.state` (`ok` / `missing` / `unreadable` /
 `unsupported_schema`) lets a consumer tell "no data" apart from "broken". Codex profiles
-carry no `quota` key at all — absent rather than null, because Codex has no usage
-endpoint, not because it is merely unsampled.
+carry no `quota` key at all — absent rather than null, because flipauth does not query
+Codex usage at all, not because a given profile is merely unsampled.
 
 ## Windows-side Codex auth path
 
