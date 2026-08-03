@@ -7,7 +7,7 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
 ## In review
 
 - [ ] **PR #1 — quota cache, `observe`, `status --json`, Codex quota.** Implemented;
-      157 offline checks across four suites. Draft; awaiting merge.
+      161 offline checks across four suites. Draft; awaiting merge.
 
 ## Next
 
@@ -79,3 +79,5 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
       names; per-service tests assert it agrees with the text rendering. (PR #1)
 - [x] `codex quota`: app-server JSON-RPC per profile, throwaway `CODEX_HOME`, refresh
       declined, windows keyed by duration, reset credits surfaced. (PR #1)
+- [x] Temp credential copies cannot outlive a query: catchable signals clean up, and an
+      uncatchable kill's leftovers are swept by the next run. (PR #1)

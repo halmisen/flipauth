@@ -132,6 +132,29 @@ check "querying did not mutate the saved snapshot" cmp -s "$STATE/work.auth.json
 check "querying did not activate another profile" bash -c "grep -qx 'alt' '$STATE/.active-profile'"
 check "no temp codex home was left behind" bash -c "! ls -d /tmp/.codex-quota-* >/dev/null 2>&1"
 
+# A query holds a real credential in a temp CODEX_HOME. It must not outlive the query,
+# including when the query is killed. TMPDIR is redirected so the sweep and the counting
+# both stay inside this test's sandbox.
+SB="$TMP/tmpdir"; mkdir -p "$SB"
+strays() { find "$SB" -maxdepth 1 -type d -name '.codex-quota-*' | wc -l; }
+printf 'hang' > "$STUB_DIR/mode"
+TMPDIR="$SB" timeout -s TERM 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
+check "SIGTERM mid-query removes the temp credential copy" test "$(strays)" = 0
+TMPDIR="$SB" timeout -s INT 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
+check "SIGINT mid-query removes the temp credential copy" test "$(strays)" = 0
+# SIGKILL cannot be caught, so the next run must sweep what it stranded.
+( TMPDIR="$SB" timeout -s KILL 1 "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 ) 2>/dev/null || true
+check "SIGKILL does strand a temp dir" bash -c "test \"\$(find '$SB' -maxdepth 1 -type d -name '.codex-quota-*' | wc -l)\" != 0"
+find "$SB" -maxdepth 1 -type d -name '.codex-quota-*' -exec touch -d '1 hour ago' {} \;
+printf 'ok' > "$STUB_DIR/mode"
+TMPDIR="$SB" "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
+check "the next run sweeps a stranded temp dir" test "$(strays)" = 0
+# A concurrent run's fresh temp dir must survive the sweep.
+FRESH="$(TMPDIR="$SB" mktemp -d "$SB/.codex-quota-XXXXXX")"
+TMPDIR="$SB" "$BIN_DIR/codex-switch" quota >/dev/null 2>&1 || true
+check "the sweep spares a fresh temp dir from a concurrent run" test -d "$FRESH"
+rmdir "$FRESH"
+
 # ---------- 3. a server-initiated refresh must be declined, never answered ----------
 : > "$STUB_DIR/calls.log"; rm -f "$STUB_DIR/refresh-declined" "$STUB_DIR/refresh-ANSWERED"
 printf 'refresh' > "$STUB_DIR/mode"
