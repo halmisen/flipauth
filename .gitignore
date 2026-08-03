@@ -3,6 +3,7 @@
 auth.json
 oauth-accounts/
 .active-profile
+.quota-cache.json
 .login-*
 *.tmp
 .oauth-switch.*
