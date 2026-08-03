@@ -1062,8 +1062,37 @@ quota_codex() {
     fail "codex command not found; set CODEX_SWITCH_CODEX_BIN to its path"
   python3 - "$STATE_DIR" "$ACTIVE_MARKER" "${ACTIVE[0]}" "${ACTIVE[1]}" "$want" \
            "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" "$bin" "${CODEX_SWITCH_QUOTA_TIMEOUT:-40}" <<'PY'
-import json, os, pathlib, shutil, subprocess, sys, tempfile, threading, time
+import json, os, pathlib, shutil, signal, subprocess, sys, tempfile, threading, time
 from datetime import datetime, timezone
+
+TEMP_PREFIX = ".codex-quota-"
+
+# A query holds a copy of a real credential in a temp CODEX_HOME for a few seconds. Two
+# defences keep that copy from outliving the query:
+#   - catch the signals we can, so the `finally` that removes the directory still runs;
+#   - sweep anything an uncatchable kill (SIGKILL, power loss) stranded earlier.
+# The sweep only touches directories with this exact prefix that we own and that are
+# older than a concurrent run could plausibly be.
+def _bail(signum, frame):
+    raise SystemExit(128 + signum)
+
+for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    try: signal.signal(_sig, _bail)
+    except (OSError, ValueError, AttributeError): pass
+
+def sweep_stranded(max_age=300):
+    try: root = pathlib.Path(tempfile.gettempdir())
+    except Exception: return
+    now = time.time(); uid = os.getuid()
+    for d in root.glob(TEMP_PREFIX + "*"):
+        try:
+            st = d.stat()
+            if d.is_dir() and st.st_uid == uid and now - st.st_mtime > max_age:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
+sweep_stranded()
 
 state_dir = pathlib.Path(sys.argv[1]); active_marker = pathlib.Path(sys.argv[2])
 live_auth = pathlib.Path(sys.argv[3]); live_creds = pathlib.Path(sys.argv[4])
@@ -1092,7 +1121,7 @@ if not profiles:
 
 def read_limits(auth_path, creds_path):
     """Drive one app-server against a throwaway CODEX_HOME. Returns (result, error)."""
-    home = pathlib.Path(tempfile.mkdtemp(prefix=".codex-quota-"))
+    home = pathlib.Path(tempfile.mkdtemp(prefix=TEMP_PREFIX))
     proc = None
     try:
         os.chmod(home, 0o700)

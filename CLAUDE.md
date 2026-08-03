@@ -23,7 +23,7 @@ bash -n ./flipauth          # syntax check (lint equivalent)
 ./tests/parity-test.sh      # full save/activate/status/doctor coverage for both services
 ./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
 ./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (79 checks)
-./tests/codex-quota-test.sh          # codex app-server quota path (53 checks, stubbed)
+./tests/codex-quota-test.sh          # codex app-server quota path (57 checks, stubbed)
 ```
 
 `quota` is the only command that reaches the network — for Claude over HTTP, for Codex by
@@ -134,7 +134,12 @@ There is no HTTP usage endpoint; the data is behind the JSON-RPC method
 1. *`CODEX_HOME` relocates the config root.* Every profile is read from a throwaway copy
    of its snapshot (dir `700`, files `600`), and nothing is ever copied back. A query
    therefore cannot mutate a saved profile or activate an account. Tests assert the temp
-   home is never the real Codex dir or the state dir.
+   home is never the real Codex dir or the state dir. That copy is a real credential, so
+   it must not outlive the query: SIGTERM/SIGINT/SIGHUP are caught so the cleanup still
+   runs, and because SIGKILL cannot be caught, each run first sweeps `.codex-quota-*`
+   directories it owns that are older than five minutes. The five-minute floor is what
+   keeps the sweep from deleting a concurrent run's live directory — do not lower it
+   without changing that reasoning, and there are tests for both halves.
 2. *`account/chatgptAuthTokens/refresh` is a server→client request.* The app-server does
    not refresh tokens itself — it asks the connected client to do it and hand the new
    token back. flipauth **declines** it, so no rotation can happen on this path. A test
