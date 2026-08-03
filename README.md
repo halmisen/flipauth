@@ -34,7 +34,7 @@ profile at once.
 - 🔁 **Instant profile switching** for both Claude Code and Codex from one tiny script.
 - 📸 **Named snapshots** of each OAuth login, stored locally with strict `600`/`700` permissions.
 - 🔒 **Atomic, validated swaps** — credentials are shape-checked before every save and load, and written via temp-file-then-rename so a crash never leaves a half-written file.
-- 📊 **Quota at a glance** — see the 5-hour and 7-day usage windows (and reset countdowns) for **all** your Claude profiles side by side.
+- 📊 **Quota at a glance** — see the rolling usage windows (and reset countdowns) for **all** your profiles side by side, for Claude *and* Codex.
 - 🗂️ **Offline quota recall** — every live quota check is cached, so `status` can show each profile's last known usage without touching the network, even for profiles whose saved token has since expired.
 - 🔌 **Free, continuous refresh** — hook `observe` onto your Claude Code status line and the active profile's cache stays current from data Claude Code already gives you, with no network request and no extra cost.
 - 🤖 **`status --json`** for scripts and agents that must pick a profile before dispatching work.
@@ -182,11 +182,12 @@ flipauth claude doctor
 flipauth codex doctor
 ```
 
-Show subscription usage (5-hour and 7-day rolling windows) for every saved Claude
+Show subscription usage (rolling windows plus reset countdowns) for every saved
 profile, or a single one:
 
 ```sh
 flipauth claude quota
+flipauth codex quota
 flipauth claude quota <profile>
 ```
 
@@ -240,7 +241,7 @@ flipauth codex doctor
 
 ## Quota
 
-`flipauth claude quota` is the only command that makes a network call. It sends each
+`quota` is the only command that reaches the network. For Claude it sends each
 saved profile's OAuth access token to Anthropic's `/api/oauth/usage` endpoint — the
 same data behind Claude Code's `/usage` — and prints the 5-hour and 7-day rolling-window
 utilization plus reset countdowns:
@@ -254,11 +255,45 @@ utilization plus reset countdowns:
 
 The active profile (`*`) is read from the live credential file; other profiles use
 their saved snapshot, so a profile whose saved token has expired shows
-`token expired — re-activate` instead of a number. This is a Claude-only feature: Codex
-is not implemented here. (Codex does report its own rate limits in its built-in status
-line, so the data exists upstream; flipauth simply does not read it yet.) The Anthropic
-endpoint is undocumented and may change. Avoid polling
-tighter than ~180s per account to stay clear of rate limiting.
+`token expired — re-activate` instead of a number. The Anthropic endpoint is
+undocumented and may change. Avoid polling tighter than ~180s per account to stay clear
+of rate limiting.
+
+### Codex quota
+
+`flipauth codex quota` answers the same question for Codex, but there is no HTTP usage
+endpoint to call. The data lives behind the JSON-RPC method `account/rateLimits/read` on
+`codex app-server --stdio`, so flipauth spawns one app-server per profile and asks:
+
+```text
+  Profile  window    used     resets
+* work         7d      3%   in 6d21h
+  other        7d     41%    in 4d2h
+* = active profile
+Reset credits for work: 1 available (expires 2026-08-13)
+```
+
+Three properties make this safe to run against a *saved* profile, and all three are
+covered by tests:
+
+- **Nothing is activated and nothing is written back.** `CODEX_HOME` relocates the whole
+  config root, so each profile is read from a throwaway copy of its snapshot (directory
+  `700`, files `600`) that is deleted afterwards. A query cannot mutate a saved profile.
+- **Token refresh is declined, not performed.** `account/chatgptAuthTokens/refresh` is a
+  *server-to-client* request: the app-server does not refresh tokens itself, it asks the
+  connected client to. flipauth answers it with an error, so a query can never rotate
+  your credentials.
+- **Windows are identified by duration, never by field name.** The response labels
+  windows `primary` and `secondary`, but those names are ordinal rather than semantic —
+  until 2026-07 `primary` was the 5-hour window and it is now the 7-day one. flipauth
+  keys on `windowDurationMins`, so a change in the backend's window set relabels the
+  output honestly instead of silently mislabelling it.
+
+However many windows the account has, each is reported with both its percentage and its
+reset countdown. `rateLimitResetCredits` — a free "full reset" some accounts are granted
+— is surfaced with its expiry in local time, since it is a deadline you act on.
+
+Codex needs the `codex` binary on `PATH`; override it with `CODEX_SWITCH_CODEX_BIN`.
 
 ### Cached quota in `status`
 
@@ -403,7 +438,9 @@ skipped.
 | `CODEX_SWITCH_AUTH_FILE` | `~/.codex/auth.json` | Live Codex auth file |
 | `CODEX_SWITCH_CREDENTIALS_FILE` | `~/.codex/.credentials.json` | Optional live Codex credentials file |
 | `CODEX_SWITCH_WINDOWS_AUTH` | auto-detect | Path to Windows-side `.codex/auth.json`; set empty to disable |
-| `CLAUDE_SWITCH_API_BASE` | `https://api.anthropic.com` | Base URL for the `quota` usage endpoint |
+| `CLAUDE_SWITCH_API_BASE` | `https://api.anthropic.com` | Base URL for the Claude `quota` usage endpoint |
+| `CODEX_SWITCH_CODEX_BIN` | `codex` | Binary used to spawn the app-server for Codex `quota` |
+| `CODEX_SWITCH_QUOTA_TIMEOUT` | `40` | Seconds to wait for one Codex app-server reply |
 
 ## Safety
 
@@ -429,6 +466,7 @@ bash -n ./flipauth          # syntax check
 ./tests/parity-test.sh      # save / activate / status / doctor coverage for both services
 ./tests/claude-doctor-test.sh   # doctor output + token-leak assertions
 ./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (local stub, no network)
+./tests/codex-quota-test.sh          # codex app-server quota path (stubbed app-server)
 ```
 
 ## License
@@ -464,7 +502,7 @@ MIT. See [`LICENSE`](LICENSE).
 - 🔁 **即时切换配置**：用一个小脚本同时管理 Claude Code 和 Codex。
 - 📸 **命名快照**：本地保存每个 OAuth 登录，目录 `700`、文件 `600` 严格权限。
 - 🔒 **原子且经过校验的替换**：保存和加载前都会校验凭据结构，并采用「先写临时文件再重命名」的方式写入，崩溃也不会留下写了一半的文件。
-- 📊 **额度一目了然**：并排查看**所有** Claude 配置的 5 小时 / 7 天用量窗口及重置倒计时。
+- 📊 **额度一目了然**：并排查看**所有**配置的滚动用量窗口及重置倒计时，Claude 和 Codex 都支持。
 - 🗂️ **离线额度回看**：每次实时额度查询都会写入缓存，`status` 因此可以不联网就展示每个配置最后一次已知用量 —— 即使该配置的快照 token 早已过期。
 - 🔌 **免费持续刷新**：把 `observe` 接到 Claude Code 的状态栏上，当前配置的缓存就会用 Claude Code 本来就给你的数据保持最新 —— 零网络请求，零成本。
 - 🤖 **`status --json`**：给需要在派发任务前先选账号的脚本和 agent 用。
@@ -611,6 +649,7 @@ flipauth codex doctor
 
 ```sh
 flipauth claude quota
+flipauth codex quota
 flipauth claude quota <profile>
 ```
 
@@ -663,7 +702,7 @@ flipauth codex doctor
 
 ## 额度（Quota）
 
-`flipauth claude quota` 是唯一会发起网络请求的命令。它把每个已保存配置的 OAuth access
+`quota` 是唯一会触及网络的命令。Claude 侧它把每个已保存配置的 OAuth access
 token 发送到 Anthropic 的 `/api/oauth/usage` 接口（即 Claude Code 的 `/usage` 背后的
 数据），打印 5 小时与 7 天滚动窗口的用量百分比及重置倒计时：
 
@@ -675,9 +714,40 @@ token 发送到 Anthropic 的 `/api/oauth/usage` 接口（即 Claude Code 的 `/
 ```
 
 当前生效配置（`*`）读取的是生效凭据文件；其它配置使用各自的快照，因此快照 token 已过期
-的配置会显示 `token expired — re-activate` 而不是数字。这是 Claude 专属功能，Codex 没有
-对应接口。该接口未公开，可能随时变动。请勿对同一账号以快于约 180 秒的频率轮询，以免触发
-限流。
+的配置会显示 `token expired — re-activate` 而不是数字。该接口未公开，可能随时变动。请勿
+对同一账号以快于约 180 秒的频率轮询，以免触发限流。
+
+### Codex 额度
+
+`flipauth codex quota` 回答同一个问题，但 Codex **没有可直接调用的 HTTP 用量接口**。数据
+在 `codex app-server --stdio` 的 JSON-RPC 方法 `account/rateLimits/read` 后面，所以
+flipauth 为每个配置各起一个 app-server 去问：
+
+```text
+  Profile  window    used     resets
+* work         7d      3%   in 6d21h
+  other        7d     41%    in 4d2h
+* = active profile
+Reset credits for work: 1 available (expires 2026-08-13)
+```
+
+有三条性质让「查询一个**已保存但未激活**的配置」是安全的，且三条都有测试覆盖：
+
+- **不激活任何账号，也不回写任何文件。** `CODEX_HOME` 会重定位整个配置根目录，所以每个
+  配置都是从自己快照的一份临时副本（目录 `700`、文件 `600`）里读的，用完即删。查询不可能
+  改动已保存的配置。
+- **token 刷新是被拒绝的，不是被执行的。** `account/chatgptAuthTokens/refresh` 是一个
+  **服务端向客户端**发起的请求——app-server 自己不刷新 token，它请求连接着的客户端去刷。
+  flipauth 一律回错误，因此查询永远不会轮换你的凭据。
+- **窗口按时长识别，绝不按字段名识别。** 响应里的窗口叫 `primary` 和 `secondary`，但这两个
+  名字是序数而非语义——2026-07 之前 `primary` 是 5 小时窗口，现在是 7 天窗口。flipauth
+  以 `windowDurationMins` 为准，所以后端窗口集合变化时输出会如实改标签，而不是静默标错。
+
+账号有几个窗口就报几个，每个都同时给出百分比和重置倒计时。同一响应里的
+`rateLimitResetCredits`（部分账号会获赠的免费「完整重置」券）也会展示，过期时间按**本地
+时区**显示，因为那是你要据以行动的截止日。
+
+Codex 侧需要 `codex` 可执行文件在 `PATH` 上；可用 `CODEX_SWITCH_CODEX_BIN` 覆盖。
 
 ### `status` 里的缓存额度
 
@@ -806,7 +876,9 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 | `CODEX_SWITCH_AUTH_FILE` | `~/.codex/auth.json` | 生效的 Codex auth 文件 |
 | `CODEX_SWITCH_CREDENTIALS_FILE` | `~/.codex/.credentials.json` | 可选的生效 Codex credentials 文件 |
 | `CODEX_SWITCH_WINDOWS_AUTH` | 自动探测 | Windows 侧 `.codex/auth.json` 路径；设为空则禁用 |
-| `CLAUDE_SWITCH_API_BASE` | `https://api.anthropic.com` | `quota` 用量接口的基础 URL |
+| `CLAUDE_SWITCH_API_BASE` | `https://api.anthropic.com` | Claude `quota` 用量接口的基础 URL |
+| `CODEX_SWITCH_CODEX_BIN` | `codex` | Codex `quota` 启动 app-server 所用的二进制 |
+| `CODEX_SWITCH_QUOTA_TIMEOUT` | `40` | 等待单次 Codex app-server 响应的秒数 |
 
 ## 安全须知
 
@@ -831,6 +903,7 @@ bash -n ./flipauth          # 语法检查
 ./tests/parity-test.sh      # 两个服务的 save / activate / status / doctor 覆盖
 ./tests/claude-doctor-test.sh   # doctor 输出与 token 不泄露断言
 ./tests/claude-quota-cache-test.sh   # 额度缓存、observe、status --json（本地 stub，不联网）
+./tests/codex-quota-test.sh          # Codex app-server 额度路径（stub app-server）
 ```
 
 ## 许可证

@@ -188,8 +188,12 @@ printf '%s' '{"auth_mode":"chatgpt","tokens":{"access_token":"a.b.c"}}' > "$CX/a
 "$BIN_DIR/codex-switch" save red >/dev/null
 CODEX_STATUS="$("$BIN_DIR/codex-switch" status)"
 check "codex status keeps its two lines" outputs "$CODEX_STATUS" '^Saved profiles: red$'
-check "codex status shows no cached quota block" lacks "$CODEX_STATUS" 'Cached quota'
-check "codex quota is still rejected" bash -c "! \"$BIN_DIR/codex-switch\" quota 2>/dev/null"
+# Codex now has a quota path of its own (see tests/codex-quota-test.sh). What must hold
+# here is that the two services never share a cache or a rendering: Codex reads its own
+# state dir, so a populated Claude cache must be invisible to it.
+check "codex status does not read the Claude cache" lacks "$CODEX_STATUS" '≥'
+check "codex status does not borrow Claude profile names" lacks "$CODEX_STATUS" 'alpha\|beta'
+check "codex quota is no longer rejected as Claude-only" bash -c "! CODEX_SWITCH_CODEX_BIN=/nonexistent-codex \"$BIN_DIR/codex-switch\" quota 2>&1 | grep -q 'Claude-only'"
 
 # ---------- 10. a profile with no sample is listed, not dropped ----------
 printf '{"claudeAiOauth":{"accessToken":"fixture-token-gamma-DO-NOT-LEAK"}}' > "$CL/.credentials.json"
@@ -310,10 +314,14 @@ d=json.load(sys.stdin)
 raise SystemExit(0 if d['cache']['state']=='unreadable' and d['profiles'] else 1)\"
   rc=\$?; cp '$TMP/ob.bak' '$CACHE2'; exit \$rc"
 CODEX_JSON="$("$BIN_DIR/codex-switch" status --json)"
-check "codex --json omits the quota key entirely" bash -c "printf '%s' \"\$0\" | python3 -c \"
+check "codex --json never carries Claude's named windows" bash -c "printf '%s' \"\$0\" | python3 -c \"
 import json,sys
 d=json.load(sys.stdin)
-raise SystemExit(0 if 'cache' not in d and all('quota' not in r for r in d['profiles']) else 1)\"" "$CODEX_JSON"
+assert d['service']=='codex'
+for r in d['profiles']:
+    q=r.get('quota')
+    assert q is None or ('five_hour' not in q and 'seven_day' not in q), q
+raise SystemExit(0)\"" "$CODEX_JSON"
 
 # ---------- 13. the two renderings must not drift apart ----------
 check "text and --json agree on every profile" bash -c "

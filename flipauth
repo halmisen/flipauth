@@ -61,7 +61,7 @@ Usage:
   $PROG status [--json]
   $PROG doctor
 USAGE
-  [[ "$SERVICE" == claude ]] && printf '  %s quota [profile]\n' "$PROG"
+  printf '  %s quota [profile]\n' "$PROG"
   [[ "$SERVICE" == claude ]] && printf '  %s observe            (reads a statusLine JSON payload on stdin)\n' "$PROG"
   [[ "$SERVICE" == claude ]] && printf '  %s login <profile> [claude auth login options]\n' "$PROG"
   return 0
@@ -215,9 +215,125 @@ cmd_status() {
     printf '\n'
     # The cached-quota block is decoration on top of status; it must never be able
     # to fail the command (including being SIGPIPE'd by `status | head`).
-    [[ "$SERVICE" == claude ]] && { status_quota_claude || true; }
+    if [[ "$SERVICE" == claude ]]; then status_quota_claude || true
+    else status_quota_codex || true; fi
   fi
   return 0
+}
+
+# The Codex half of the cached-quota block. Same discipline as the Claude one — a
+# cached percentage is a lower bound (`≥N%`), an elapsed window degrades to `unknown` —
+# but the number of windows is not fixed, so rows are emitted per window and each one is
+# labelled from its recorded duration rather than from a hardcoded name.
+status_quota_codex() {
+  python3 - "$STATE_DIR" "$QUOTA_CACHE" "$ACTIVE_MARKER" "$QUOTA_CACHE_SCHEMA" "$(_quota_hint)" <<'PY'
+import json, pathlib, signal, sys
+from datetime import datetime, timezone
+
+try: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError): pass
+
+state_dir = pathlib.Path(sys.argv[1]); cache_path = pathlib.Path(sys.argv[2])
+active_marker = pathlib.Path(sys.argv[3]); schema = int(sys.argv[4]); hint = sys.argv[5]
+
+profiles = sorted(p.name[: -len(".auth.json")] for p in state_dir.glob("*.auth.json"))
+if not profiles:
+    raise SystemExit(0)
+
+def no_samples():
+    print(f"Cached quota: no samples yet — run '{hint}'")
+    raise SystemExit(0)
+
+if not cache_path.exists():
+    no_samples()
+try:
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    if not isinstance(cache, dict): raise ValueError("not an object")
+except Exception:
+    print(f"Cached quota: unavailable (cache unreadable) — refresh with '{hint}'")
+    raise SystemExit(0)
+if cache.get("schema") != schema:
+    print(f"Cached quota: unavailable (unsupported cache schema) — refresh with '{hint}'")
+    raise SystemExit(0)
+entries = cache.get("profiles")
+if not isinstance(entries, dict) or not any(n in entries for n in profiles):
+    no_samples()
+
+active = ""
+if active_marker.exists():
+    try: active = active_marker.read_text(encoding="utf-8").strip()
+    except Exception: active = ""
+
+now = datetime.now(timezone.utc)
+
+def parse(iso):
+    if not isinstance(iso, str) or not iso: return None
+    try: dt = datetime.fromisoformat(iso)
+    except ValueError: return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+def span(secs):
+    d, rem = divmod(int(secs), 86400); h, rem = divmod(rem, 3600); m = rem // 60
+    if d: return f"{d}d{h}h"
+    if h: return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+def label(minutes):
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0: return "?"
+    if minutes % 1440 == 0: return f"{minutes // 1440}d"
+    if minutes % 60 == 0: return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+def age(entry):
+    fetched = parse(entry.get("fetched_at"))
+    if fetched is None: return "?"
+    secs = (now - fetched).total_seconds()
+    if secs < 0: return "just now"
+    return "just now" if secs < 60 else f"{span(secs)} ago"
+
+rows, credits = [], []
+for name in profiles:
+    mark = "*" if name == active else " "
+    entry = entries.get(name)
+    wins = entry.get("windows") if isinstance(entry, dict) else None
+    if not isinstance(wins, list) or not wins:
+        rows.append((mark, name, "no sample", "", "", "")); continue
+    when = age(entry)
+    first = True
+    for w in wins:
+        if not isinstance(w, dict): continue
+        util = w.get("utilization"); resets = parse(w.get("resets_at"))
+        if (not isinstance(util, (int, float)) or isinstance(util, bool)
+                or resets is None or (resets - now).total_seconds() <= 0):
+            used, left = "unknown", "—"
+        else:
+            used, left = f"≥{util:.0f}%", f"in {span((resets - now).total_seconds())}"
+        rows.append((mark if first else " ", name if first else "",
+                     label(w.get("duration_minutes")), used, left, when if first else ""))
+        first = False
+    got = entry.get("reset_credits")
+    if isinstance(got, dict) and isinstance(got.get("available"), int) and got["available"] > 0:
+        credits.append((name, got))
+
+w = max([len(r[1]) for r in rows] + [len("Profile")])
+print()
+print("Cached quota (offline snapshot, not live — a cached % is a lower bound):")
+print(f"  {'Profile':<{w}}  {'window':>6}  {'used':>7}  {'resets':>9}  {'sampled':>9}")
+for mark, name, win, used, left, when in rows:
+    if used == "" and left == "":
+        print(f"{mark} {name:<{w}}  {win}")
+    else:
+        print(f"{mark} {name:<{w}}  {win:>6}  {used:>7}  {left:>9}  {when:>9}")
+def local_date(iso_text):
+    dt = parse(iso_text)
+    return dt.astimezone().strftime("%Y-%m-%d") if dt else None
+
+for name, got in credits:
+    exp = local_date(got.get("expires_at"))
+    tail = f" (expires {exp})" if exp else ""
+    print(f"Reset credits for {name}: {got['available']} available{tail}")
+print(f"* = active profile; refresh with '{hint}'")
+PY
 }
 
 # Machine-readable `status`, for callers that must decide which profile to hand work
@@ -226,8 +342,9 @@ cmd_status() {
 # read a cached number as an exact one:
 #   utilization_at_least  a lower bound, never a measurement
 #   state                 known | expired | missing
-# Codex profiles carry no `quota` key at all — the field is absent rather than null,
-# because Codex has no usage endpoint, not because it is merely unsampled.
+# Both services carry a `quota` key, but its inner shape differs because the services
+# genuinely differ: Claude has exactly two named windows, Codex has a variable-length
+# `windows` list identified by duration. Consumers branch on `service`.
 cmd_status_json() {
   python3 - "$SERVICE" "$STATE_DIR" "${SUFFIX[0]}" "$ACTIVE_MARKER" \
            "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" <<'PY'
@@ -251,21 +368,20 @@ if active_marker.exists():
 doc = {"service": service, "active_profile": active, "profiles": []}
 
 entries, cache_state = {}, "missing"
-if service == "claude":
-    if cache_path.exists():
-        try:
-            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-            if not isinstance(loaded, dict):
-                cache_state = "unreadable"
-            elif loaded.get("schema") != schema:
-                cache_state = "unsupported_schema"
-            elif not isinstance(loaded.get("profiles"), dict):
-                cache_state = "unreadable"
-            else:
-                entries, cache_state = loaded["profiles"], "ok"
-        except Exception:
+if cache_path.exists():
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
             cache_state = "unreadable"
-    doc["cache"] = {"state": cache_state}
+        elif loaded.get("schema") != schema:
+            cache_state = "unsupported_schema"
+        elif not isinstance(loaded.get("profiles"), dict):
+            cache_state = "unreadable"
+        else:
+            entries, cache_state = loaded["profiles"], "ok"
+    except Exception:
+        cache_state = "unreadable"
+doc["cache"] = {"state": cache_state}
 
 now = datetime.now(timezone.utc)
 
@@ -288,21 +404,57 @@ def window(entry, key):
         return {"state": "expired", "utilization_at_least": None, "resets_at": raw_resets}
     return {"state": "known", "utilization_at_least": util, "resets_at": raw_resets}
 
+def duration_label(minutes):
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0: return None
+    if minutes % 1440 == 0: return f"{minutes // 1440}d"
+    if minutes % 60 == 0: return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+# Codex windows come as a list; state is computed exactly as for a Claude window so the
+# two services never disagree about what "expired" or "lower bound" means.
+def codex_window(w):
+    if not isinstance(w, dict):
+        return None
+    mins = w.get("duration_minutes") if isinstance(w.get("duration_minutes"), int) else None
+    raw_resets = w.get("resets_at") if isinstance(w.get("resets_at"), str) else None
+    out = {"duration_minutes": mins, "label": duration_label(mins), "resets_at": raw_resets}
+    util = w.get("utilization"); resets = parse(raw_resets)
+    if not isinstance(util, (int, float)) or isinstance(util, bool) or resets is None:
+        out.update(state="missing", utilization_at_least=None)
+    elif (resets - now).total_seconds() <= 0:
+        out.update(state="expired", utilization_at_least=None)
+    else:
+        out.update(state="known", utilization_at_least=util)
+    return out
+
 for name in names:
     row = {"name": name, "active": name == active}
-    if service == "claude":
-        entry = entries.get(name)
-        if not isinstance(entry, dict):
-            row["quota"] = None
+    entry = entries.get(name)
+    if not isinstance(entry, dict):
+        row["quota"] = None
+    else:
+        fetched = parse(entry.get("fetched_at"))
+        quota = {
+            "sampled_at": entry.get("fetched_at") if isinstance(entry.get("fetched_at"), str) else None,
+            "age_seconds": int((now - fetched).total_seconds()) if fetched else None,
+            "source": entry.get("source") if isinstance(entry.get("source"), str) else None,
+        }
+        if service == "claude":
+            quota["five_hour"] = window(entry, "five_hour")
+            quota["seven_day"] = window(entry, "seven_day")
         else:
-            fetched = parse(entry.get("fetched_at"))
-            row["quota"] = {
-                "sampled_at": entry.get("fetched_at") if isinstance(entry.get("fetched_at"), str) else None,
-                "age_seconds": int((now - fetched).total_seconds()) if fetched else None,
-                "source": entry.get("source") if isinstance(entry.get("source"), str) else None,
-                "five_hour": window(entry, "five_hour"),
-                "seven_day": window(entry, "seven_day"),
-            }
+            wins = entry.get("windows")
+            quota["windows"] = [w for w in (codex_window(x) for x in wins) if w] \
+                if isinstance(wins, list) else []
+            if isinstance(entry.get("plan_type"), str):
+                quota["plan_type"] = entry["plan_type"]
+            got = entry.get("reset_credits")
+            if isinstance(got, dict) and isinstance(got.get("available"), int):
+                quota["reset_credits"] = {
+                    "available": got["available"],
+                    "expires_at": got.get("expires_at") if isinstance(got.get("expires_at"), str) else None,
+                }
+        row["quota"] = quota
     doc["profiles"].append(row)
 
 print(json.dumps(doc, indent=2, sort_keys=True))
@@ -490,7 +642,7 @@ _claude_user_agent() {
 
 # How the user would refresh the cache, phrased for the invocation name in use.
 _quota_hint() {
-  if [[ "$PROG" == flipauth ]]; then printf 'flipauth claude quota'; else printf '%s quota' "$PROG"; fi
+  if [[ "$PROG" == flipauth ]]; then printf 'flipauth %s quota' "$SERVICE"; else printf '%s quota' "$PROG"; fi
 }
 
 # Render the cached quota block appended to `status`. Strictly offline: it reads
@@ -887,11 +1039,273 @@ print("* = active profile")
 PY
 }
 
+# Read Codex rolling-window usage for each saved profile.
+#
+# Codex has no HTTP usage endpoint to call directly; the data lives behind the
+# app-server's JSON-RPC method `account/rateLimits/read`. Three properties of that
+# protocol make it safe to drive from here, and each one is load-bearing:
+#
+#   - `CODEX_HOME` relocates the whole config root, so a profile is read from a
+#     throwaway copy of its snapshot. Nothing is ever copied back, so a saved profile
+#     cannot be mutated by a query, and the live account is never activated.
+#   - `account/chatgptAuthTokens/refresh` is a *server->client* request: the app-server
+#     does not refresh tokens itself, it asks the connected client to do it and hand the
+#     new token back. We decline it, so no token rotation can occur on this path.
+#   - Windows are identified by `windowDurationMins`, never by the `primary`/`secondary`
+#     field names. Those names are ordinal, not semantic: until 2026-07 `primary` was the
+#     5-hour window, and it is now the 7-day one. Keying on the field name would silently
+#     mislabel the data the next time the backend's window set changes.
+quota_codex() {
+  local want="${1:-}" bin
+  bin="${CODEX_SWITCH_CODEX_BIN:-codex}"
+  command -v "$bin" >/dev/null 2>&1 ||
+    fail "codex command not found; set CODEX_SWITCH_CODEX_BIN to its path"
+  python3 - "$STATE_DIR" "$ACTIVE_MARKER" "${ACTIVE[0]}" "${ACTIVE[1]}" "$want" \
+           "$QUOTA_CACHE" "$QUOTA_CACHE_SCHEMA" "$bin" "${CODEX_SWITCH_QUOTA_TIMEOUT:-40}" <<'PY'
+import json, os, pathlib, shutil, subprocess, sys, tempfile, threading, time
+from datetime import datetime, timezone
+
+state_dir = pathlib.Path(sys.argv[1]); active_marker = pathlib.Path(sys.argv[2])
+live_auth = pathlib.Path(sys.argv[3]); live_creds = pathlib.Path(sys.argv[4])
+want = sys.argv[5]; cache_path = pathlib.Path(sys.argv[6]); cache_schema = int(sys.argv[7])
+codex_bin = sys.argv[8]; timeout = float(sys.argv[9])
+
+active = ""
+if active_marker.exists():
+    try: active = active_marker.read_text(encoding="utf-8").strip()
+    except Exception: active = ""
+
+profiles = {}
+if state_dir.exists():
+    for p in sorted(state_dir.glob("*.auth.json")):
+        name = p.name[: -len(".auth.json")]
+        creds = state_dir / f"{name}.credentials.json"
+        profiles[name] = (p, creds if creds.exists() else None)
+if active and live_auth.exists():
+    profiles[active] = (live_auth, live_creds if live_creds.exists() else None)
+if want:
+    profiles = {k: v for k, v in profiles.items() if k == want}
+    if not profiles:
+        print(f"no saved profile named {want}"); raise SystemExit(1)
+if not profiles:
+    print("Saved profiles: none"); raise SystemExit(0)
+
+def read_limits(auth_path, creds_path):
+    """Drive one app-server against a throwaway CODEX_HOME. Returns (result, error)."""
+    home = pathlib.Path(tempfile.mkdtemp(prefix=".codex-quota-"))
+    proc = None
+    try:
+        os.chmod(home, 0o700)
+        shutil.copy2(auth_path, home / "auth.json"); os.chmod(home / "auth.json", 0o600)
+        if creds_path:
+            shutil.copy2(creds_path, home / ".credentials.json")
+            os.chmod(home / ".credentials.json", 0o600)
+        env = dict(os.environ, CODEX_HOME=str(home))
+        env.pop("CODEX_SWITCH_CODEX_DIR", None)
+        proc = subprocess.Popen([codex_bin, "app-server", "--stdio"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
+        seen, lock = [], threading.Lock()
+        def send(msg):
+            proc.stdin.write(json.dumps(msg) + "\n"); proc.stdin.flush()
+        def pump():
+            try:
+                for line in proc.stdout:
+                    try: msg = json.loads(line)
+                    except Exception: continue
+                    with lock: seen.append(msg)
+                    # Decline the refresh request; never rotate a real token from here.
+                    if msg.get("method") == "account/chatgptAuthTokens/refresh" and "id" in msg:
+                        try:
+                            send({"jsonrpc": "2.0", "id": msg["id"],
+                                  "error": {"code": -32000, "message": "flipauth does not refresh tokens"}})
+                        except Exception: pass
+            except Exception: pass
+        threading.Thread(target=pump, daemon=True).start()
+        deadline = time.time() + timeout
+        def wait(ident):
+            while time.time() < deadline:
+                with lock:
+                    for msg in seen:
+                        if msg.get("id") == ident and ("result" in msg or "error" in msg):
+                            return msg
+                if proc.poll() is not None: return None
+                time.sleep(0.05)
+            return None
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "flipauth", "title": "flipauth", "version": "1"},
+                         "capabilities": {"experimentalApi": True, "requestAttestation": False}}})
+        if wait(1) is None:
+            return None, "app-server did not start"
+        send({"method": "initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "account/rateLimits/read", "params": None})
+        reply = wait(2)
+        if reply is None:
+            return None, "timeout"
+        if "error" in reply:
+            msg = str(reply["error"].get("message", "error"))
+            if "401" in msg or "nauthor" in msg: return None, "token expired — re-login"
+            return None, f"error: {msg[:48]}"
+        return reply.get("result") or {}, None
+    except FileNotFoundError:
+        return None, "codex not executable"
+    except Exception as exc:
+        return None, f"error: {type(exc).__name__}"
+    finally:
+        if proc is not None:
+            try: proc.terminate(); proc.wait(timeout=5)
+            except Exception:
+                try: proc.kill()
+                except Exception: pass
+        shutil.rmtree(home, ignore_errors=True)
+
+def label(minutes):
+    if not isinstance(minutes, int) or minutes <= 0: return "?"
+    if minutes % 1440 == 0: return f"{minutes // 1440}d"
+    if minutes % 60 == 0: return f"{minutes // 60}h"
+    return f"{minutes}m"
+
+def iso(epoch):
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool): return None
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds")
+
+def rel(epoch):
+    if not isinstance(epoch, (int, float)) or isinstance(epoch, bool): return "—"
+    secs = epoch - time.time()
+    if secs <= 0: return "due"
+    d, rem = divmod(int(secs), 86400); h, rem = divmod(rem, 3600); m = rem // 60
+    if d: return f"in {d}d{h}h"
+    if h: return f"in {h}h{m:02d}m"
+    return f"in {m}m"
+
+# Allow-list the response into cache-shaped windows. Identity comes from the duration.
+def windows_of(snapshot):
+    out = []
+    if not isinstance(snapshot, dict): return out
+    for key in ("primary", "secondary"):
+        w = snapshot.get(key)
+        if not isinstance(w, dict): continue
+        used = w.get("usedPercent")
+        if not isinstance(used, (int, float)) or isinstance(used, bool): continue
+        entry = {"utilization": used}
+        mins = w.get("windowDurationMins")
+        if isinstance(mins, int) and not isinstance(mins, bool):
+            entry["duration_minutes"] = mins
+        resets = iso(w.get("resetsAt"))
+        if resets: entry["resets_at"] = resets
+        out.append(entry)
+    out.sort(key=lambda e: e.get("duration_minutes") or 0)
+    return out
+
+def credits_of(result):
+    summary = result.get("rateLimitResetCredits")
+    if not isinstance(summary, dict): return None
+    count = summary.get("availableCount")
+    if not isinstance(count, int) or isinstance(count, bool): return None
+    out = {"available": count}
+    rows = summary.get("credits")
+    if isinstance(rows, list):
+        expiries = [r.get("expiresAt") for r in rows
+                    if isinstance(r, dict) and isinstance(r.get("expiresAt"), int)
+                    and r.get("status") == "available"]
+        if expiries:
+            out["expires_at"] = iso(min(expiries))
+    return out
+
+samples, rows = {}, []
+for name, (auth_path, creds_path) in profiles.items():
+    mark = "*" if name == active else " "
+    result, err = read_limits(auth_path, creds_path)
+    if err:
+        rows.append((mark, name, err, None)); continue
+    snapshot = result.get("rateLimits") if isinstance(result, dict) else None
+    wins = windows_of(snapshot)
+    if not wins:
+        rows.append((mark, name, "no window reported", None)); continue
+    entry = {"fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "source": "live" if auth_path == live_auth else "snapshot",
+             "windows": wins}
+    plan = snapshot.get("planType") if isinstance(snapshot, dict) else None
+    if isinstance(plan, str): entry["plan_type"] = plan
+    creds = credits_of(result)
+    if creds: entry["reset_credits"] = creds
+    samples[name] = entry
+    rows.append((mark, name, None, (wins, creds, snapshot.get("primary") or {}, snapshot.get("secondary") or {})))
+
+def write_cache(new):
+    if not new: return
+    kept = {}
+    if cache_path.exists():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (isinstance(loaded, dict) and loaded.get("schema") == cache_schema
+                    and isinstance(loaded.get("profiles"), dict)):
+                kept = loaded["profiles"]
+        except Exception:
+            kept = {}
+    kept.update(new)
+    tmp = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(cache_path.parent), prefix=".quota-cache.")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"schema": cache_schema, "profiles": kept}, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, cache_path); tmp = None
+    except Exception as exc:
+        if tmp:
+            try: os.unlink(tmp)
+            except OSError: pass
+        print(f"note: quota cache not updated ({type(exc).__name__})", file=sys.stderr)
+
+write_cache(samples)
+
+flat = []
+for mark, name, err, data in rows:
+    if err: flat.append((mark, name, err, "", ""))
+    else:
+        wins, _creds, prim, sec = data
+        raw = {w.get("duration_minutes"): w for w in wins}
+        for w in wins:
+            resets_epoch = None
+            for src in (prim, sec):
+                if isinstance(src, dict) and src.get("windowDurationMins") == w.get("duration_minutes"):
+                    resets_epoch = src.get("resetsAt")
+            flat.append((mark, name, label(w.get("duration_minutes")),
+                         f"{w['utilization']:.0f}%", rel(resets_epoch)))
+            mark, name = " ", ""
+
+w_name = max([len(r[1]) for r in flat] + [len("Profile")])
+print(f"  {'Profile':<{w_name}}  {'window':>6}  {'used':>6}  {'resets':>9}")
+for mark, name, a, b, c in flat:
+    if b == "" and c == "":
+        print(f"{mark} {name:<{w_name}}  {a}")
+    else:
+        print(f"{mark} {name:<{w_name}}  {a:>6}  {b:>6}  {c:>9}")
+print("* = active profile")
+
+# The expiry is a deadline the operator acts on, so show it in local time. The cache
+# keeps UTC; rendering the UTC date here would be off by a day in eastern time zones.
+def local_date(iso_text):
+    if not isinstance(iso_text, str): return None
+    try: dt = datetime.fromisoformat(iso_text)
+    except ValueError: return None
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%Y-%m-%d")
+
+for _m, name, _e, data in rows:
+    if data and data[1]:
+        creds = data[1]
+        when = local_date(creds.get("expires_at"))
+        tail = f" (expires {when})" if when else ""
+        print(f"Reset credits for {name}: {creds['available']} available{tail}")
+PY
+}
+
 cmd_quota() {
-  [[ "$SERVICE" == claude ]] ||
-    fail "quota is Claude-only (Anthropic OAuth usage endpoint); not supported for $SERVICE"
   [[ -n "${1:-}" ]] && validate_profile_name "$1"
-  quota_claude "${1:-}"
+  if [[ "$SERVICE" == claude ]]; then quota_claude "${1:-}"; else quota_codex "${1:-}"; fi
 }
 
 case "${1:-}" in

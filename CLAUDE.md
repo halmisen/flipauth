@@ -22,15 +22,22 @@ does not get re-litigated.
 bash -n ./flipauth          # syntax check (lint equivalent)
 ./tests/parity-test.sh      # full save/activate/status/doctor coverage for both services
 ./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
-./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (78 checks)
+./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (79 checks)
+./tests/codex-quota-test.sh          # codex app-server quota path (53 checks, stubbed)
 ```
 
-`quota` is the one command that hits the network. `claude-quota-cache-test.sh` covers
-it offline by starting a local `http.server` stub and pointing `CLAUDE_SWITCH_API_BASE`
-at it, which also lets it drive 401/429/connection-failure paths deterministically. It
-also asserts that `status`, `status --json`, and `observe` issue no request at all — the
-stub's request log is compared before and after. Only a real end-to-end check against
-Anthropic still needs a live token.
+`quota` is the only command that reaches the network — for Claude over HTTP, for Codex by
+spawning `codex app-server`. Both are stubbed, so the whole suite runs offline.
+
+`claude-quota-cache-test.sh` starts a local `http.server` and points
+`CLAUDE_SWITCH_API_BASE` at it, which also drives the 401/429/connection-failure paths
+deterministically. `codex-quota-test.sh` substitutes a fake app-server via
+`CODEX_SWITCH_CODEX_BIN` and uses it to assert the things a live account cannot show:
+that each profile is read from a throwaway `CODEX_HOME`, that snapshots are never
+mutated, and that a server-initiated token refresh is declined rather than answered.
+Both suites compare the stub's call log before and after `status` / `status --json` /
+`observe` to prove those issue no request at all. Only a real end-to-end run still needs
+live credentials.
 
 Run a single test by invoking its script directly — tests are plain Bash with a `check`
 helper, not a framework. They drive the real script in an isolated `mktemp -d` sandbox by
@@ -66,20 +73,17 @@ Claude-managed OAuth blocks such as `designOauth`; Codex accepts any JSON object
 `cmd_activate` auto-saves the currently-live credentials back into the outgoing profile
 before loading the new one, so an in-progress token refresh is never silently lost.
 
-**Quota is the only networked command.** `flipauth claude quota [profile]` (Claude
-only) sends each saved profile's OAuth access token to Anthropic's undocumented
+**Quota is the only networked command.** `flipauth claude quota [profile]`
+sends each saved profile's OAuth access token to Anthropic's undocumented
 `GET /api/oauth/usage` endpoint (base overridable via `CLAUDE_SWITCH_API_BASE`) and
 prints 5-hour / 7-day rolling-window utilization plus reset countdowns. It requires
 headers `anthropic-beta: oauth-2025-04-20` and `User-Agent: claude-code/<version>`
 (omitting the User-Agent triggers persistent 429s; the version is read from the
 installed `claude` CLI with a hardcoded fallback). Every other command is offline.
 The active profile uses the live credential file (freshest token); others use their
-saved snapshot and degrade to `token expired — re-activate` on 401. `cmd_quota`
-hard-fails for Codex because **flipauth has no Codex implementation**, not because
-Codex lacks usage data: codex-cli 0.146.0 does expose an app-server JSON-RPC method
-`account/rateLimits/read`. Whether flipauth can drive it per saved profile is
-unverified — see `docs/local/codex-quota-handoff.md` if present. Keep quota opt-in and
-non-fatal — it must never make `status`/`save`/`activate` depend on the network.
+saved snapshot and degrade to `token expired — re-activate` on 401. Codex has its own
+path (below) rather than an HTTP endpoint. Keep quota opt-in and non-fatal for both —
+it must never make `status`/`save`/`activate` depend on the network.
 
 **The quota cache separates observation from authorisation.** Every successful usage
 response is merged into `$STATE_DIR/.quota-cache.json` (schema `1`, mode `600`, atomic
@@ -123,12 +127,40 @@ writes the same schema-1 entries with `source: "statusline"`. Consequences worth
   cross-check** — do not invent one from the credential file hash, which changes on every
   token refresh and would only produce false alarms.
 
+**Codex quota goes through the app-server, and three protocol facts make it safe.**
+There is no HTTP usage endpoint; the data is behind the JSON-RPC method
+`account/rateLimits/read` on `codex app-server --stdio`. Each of these is load-bearing:
+
+1. *`CODEX_HOME` relocates the config root.* Every profile is read from a throwaway copy
+   of its snapshot (dir `700`, files `600`), and nothing is ever copied back. A query
+   therefore cannot mutate a saved profile or activate an account. Tests assert the temp
+   home is never the real Codex dir or the state dir.
+2. *`account/chatgptAuthTokens/refresh` is a server→client request.* The app-server does
+   not refresh tokens itself — it asks the connected client to do it and hand the new
+   token back. flipauth **declines** it, so no rotation can happen on this path. A test
+   drives a stub that issues the request and asserts flipauth answers with an error and
+   never with a result. Do not "helpfully" implement that handler.
+3. *Windows are identified by `windowDurationMins`, never by `primary`/`secondary`.*
+   Those names are ordinal, not semantic: until 2026-07 `primary` was the 5-hour window;
+   it is now the 7-day one and `secondary` is null. Keying on the field name would
+   silently mislabel the data the next time the backend's window set changes. This is
+   also why the Codex cache holds a `windows` **list** keyed by duration rather than the
+   two fixed keys the Claude cache uses — the two services keep separate cache files
+   (they already live in separate state dirs) precisely so Claude's shape is not forced
+   onto Codex.
+
+`usedPercent` is on a 0-100 scale — verified empirically, not inferred from the name:
+`100.0` appears in recorded session history. `rateLimitResetCredits` from the same
+response is surfaced too; its expiry is rendered in **local** time because it is a
+deadline the operator acts on, while the cache stores UTC.
+
 **`status --json` must agree with the text form.** It is a second rendering of the same
 cache, so the lower-bound and expired-window semantics are carried in the field names:
 `utilization_at_least` (never `utilization`) and `state` ∈ `known`/`expired`/`missing`.
-Codex rows omit `quota` entirely rather than setting it null — absent because there is no
-endpoint, not because it is unsampled. A test asserts the two renderings agree on every
-profile; that test is the reason the duplicated window logic is safe to keep.
+Both services carry `quota`, but the inner shape differs because the services genuinely
+differ: Claude has two named windows, Codex a variable-length `windows` list. Each service
+has a test asserting its text and JSON renderings agree on every profile; those tests are
+the reason the duplicated window logic is safe to keep.
 
 **Doctor inspects without leaking.** `doctor` is a Python heredoc per service. It reports
 file modes, sizes, and `sha16` hashes — never raw tokens. For Codex it decodes the JWT
