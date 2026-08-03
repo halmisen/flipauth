@@ -18,6 +18,16 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
       hostname, a home path and a credential file hash. Must happen **after** PR #1 merges,
       or that branch is orphaned onto discarded history.
 
+- [ ] **Codex quota — premise corrected, needs investigation.** The earlier note that
+      "Codex has no usage endpoint" is false as of codex-cli 0.146.0: its app-server
+      exposes a JSON-RPC method `account/rateLimits/read`, and Codex's built-in status
+      line already renders `five-hour-limit` / `weekly-limit`. Unlike Claude Code, Codex
+      pipes nothing to an external command (`status_line` in `config.toml` is a list of
+      built-in widget names), so the `observe` interception has no equivalent. Three
+      things are unverified: whether the RPC can be driven over `codex app-server` stdio,
+      what it returns, and whether `CODEX_HOME` lets it answer for a *saved* profile
+      without activating it. Handoff written for Codex to answer these.
+
 ## Deferred, with reasons
 
 - **Spend / cost ledger (`run`, `spend`).** Specced, then dropped before implementation —

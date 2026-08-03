@@ -74,9 +74,12 @@ headers `anthropic-beta: oauth-2025-04-20` and `User-Agent: claude-code/<version
 (omitting the User-Agent triggers persistent 429s; the version is read from the
 installed `claude` CLI with a hardcoded fallback). Every other command is offline.
 The active profile uses the live credential file (freshest token); others use their
-saved snapshot and degrade to `token expired — re-activate` on 401. Codex has no
-equivalent endpoint, so `cmd_quota` hard-fails for it. Keep it opt-in and
-non-fatal — `quota` must never make `status`/`save`/`activate` depend on the network.
+saved snapshot and degrade to `token expired — re-activate` on 401. `cmd_quota`
+hard-fails for Codex because **flipauth has no Codex implementation**, not because
+Codex lacks usage data: codex-cli 0.146.0 does expose an app-server JSON-RPC method
+`account/rateLimits/read`. Whether flipauth can drive it per saved profile is
+unverified — see `docs/local/codex-quota-handoff.md` if present. Keep quota opt-in and
+non-fatal — it must never make `status`/`save`/`activate` depend on the network.
 
 **The quota cache separates observation from authorisation.** Every successful usage
 response is merged into `$STATE_DIR/.quota-cache.json` (schema `1`, mode `600`, atomic
