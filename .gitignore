@@ -15,3 +15,9 @@ README.local.md
 *.local.md
 docs/local/
 docs/private/
+
+# Agent harness working state. `.claude/worktrees/` holds full checkout copies
+# and `settings.local.json` holds machine-local permissions; neither belongs in
+# a public repo. A shared `.claude/settings.json` may still be committed.
+.claude/worktrees/
+.claude/settings.local.json
