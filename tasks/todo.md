@@ -4,19 +4,14 @@ Short-file control plane. One line per item, newest section first. Keep operator
 specifics (account labels, machine paths, real usage figures) out of this file —
 they belong in ignored local notes, per README.md → *Privacy boundary*.
 
-## In review
-
-- [ ] **PR #1 — quota cache, `observe`, `status --json`, Codex quota.** Implemented;
-      164 offline checks across four suites. Draft; awaiting merge.
-
 ## Next
 
-- [ ] Hook `observe` onto the local Claude Code status line. One line at the end of the
-      statusLine script; until that is done the Claude cache is only as fresh as the last
-      manual `quota` run. Machine-local config, not a repo change.
 - [ ] Remove `pic/*.png` from history. The screenshots carry real account labels, a
       hostname, a home path and a credential file hash. Must happen **after** PR #1 merges,
       or that branch is orphaned onto discarded history.
+- [ ] OSS statusLine onboarding: detect a missing Claude `statusLine`, offer an explicit
+      opt-in setup, preserve and back up existing settings, use a portable command path,
+      and make the setup idempotent; never silently overwrite a configured user's command.
 - [ ] Redeem the Codex "full reset" credit before it expires, or let it lapse knowingly.
       `codex quota` now prints the count and expiry; consuming it needs
       `account/rateLimitResetCredit/consume`, which is a *write* and deliberately out of
@@ -70,6 +65,10 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
 
 ## Done
 
+- [x] PR #1 — quota cache, `observe`, `status --json`, Codex quota; 164 offline checks
+      across four suites; merged to `master`.
+- [x] Hook the local Claude Code status line to feed its payload to `flipauth claude observe`.
+      Machine-local config; failures stay silent and never break the rendered status line.
 - [x] Quota cache: allow-listed fields, atomic `600` write, merge-not-replace, failures
       preserve the last good sample. (PR #1)
 - [x] Cached quota in `status`: `≥N%` lower bound, expired window degrades to `unknown`,
