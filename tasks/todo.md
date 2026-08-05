@@ -6,9 +6,6 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
 
 ## Next
 
-- [x] Remove `pic/*.png` from history. The screenshots carry real account labels, a
-      hostname, a home path and a credential file hash. Must happen **after** PR #1 merges,
-      or that branch is orphaned onto discarded history.
 - [ ] OSS statusLine onboarding: detect a missing Claude `statusLine`, offer an explicit
       opt-in setup, preserve and back up existing settings, use a portable command path,
       and make the setup idempotent; never silently overwrite a configured user's command.
@@ -19,31 +16,6 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
 
 ## Deferred, with reasons
 
-- **Consuming rate-limit reset credits from flipauth.** The RPC exists
-  (`account/rateLimitResetCredit/consume`) but it mutates account state. flipauth reads;
-  it does not spend. Displaying the balance is the useful half and carries no risk.
-- **Codex `observe`.** There is no equivalent of the Claude statusLine hook: Codex's
-  `status_line` in `config.toml` is a list of built-in widget names, not an external
-  command, so there is nothing to intercept. Codex's cache is refreshed by `quota` only.
-- **Spend / cost ledger (`run`, `spend`).** Specced, then dropped before implementation —
-  not wanted. The three measurements behind it are worth remembering if it ever returns:
-  `claude -p --output-format json` reports `total_cost_usd` in its `result` event; a
-  `rate_limit_event` in the same stream carries `isUsingOverage`, a direct answer to
-  "is this call billing past the subscription"; and a trivial delegated call costs about
-  the same as a substantial one, because the system-prompt cache read dominates — so cost
-  tracks call *count*, not task size. All three are free to obtain.
-- **Automatic stop-at-threshold / account rotation.** Rejected twice over: a utilization
-  percentage cannot express dollars, and an automatic brake removes the decision from the
-  operator rather than informing it.
-- **Cross-checking `observe`'s profile attribution.** There is no account identifier in
-  Claude credentials, and the credential file hash changes on every token refresh, so any
-  check built from it produces false alarms rather than safety.
-- **Testing a *successful* Codex token refresh.** Not needed, and not worth the risk of
-  rotating a real refresh token: `account/chatgptAuthTokens/refresh` is a server→client
-  request, so declining it means the refresh never happens. A test asserts flipauth
-  answers that request with an error and never with a result. What remains formally
-  unproven is only whether the app-server has an internal fallback after a client
-  declines; the RPC's existence and its response shape argue strongly against one.
 - **`quota` SIGPIPE handling.** `flipauth claude quota | head` can still emit a
   `BrokenPipeError` traceback. Pre-existing; `status` was fixed in PR #1 because that
   change introduced it there. Small, self-contained follow-up.
@@ -65,6 +37,9 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
 
 ## Done
 
+- [x] Remove `pic/*.png` from history. The screenshots carried real account labels, a
+      hostname, a home path and a credential file hash; the cleanup was completed after
+      PR #1 merged.
 - [x] PR #1 — quota cache, `observe`, `status --json`, Codex quota; 164 offline checks
       across four suites; merged to `master`.
 - [x] Hook the local Claude Code status line to feed its payload to `flipauth claude observe`.
