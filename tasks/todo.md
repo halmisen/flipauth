@@ -6,7 +6,7 @@ they belong in ignored local notes, per README.md → *Privacy boundary*.
 
 ## Next
 
-- [ ] Remove `pic/*.png` from history. The screenshots carry real account labels, a
+- [x] Remove `pic/*.png` from history. The screenshots carry real account labels, a
       hostname, a home path and a credential file hash. Must happen **after** PR #1 merges,
       or that branch is orphaned onto discarded history.
 - [ ] OSS statusLine onboarding: detect a missing Claude `statusLine`, offer an explicit
