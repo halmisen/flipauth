@@ -14,9 +14,11 @@ inspection). Target platform is Windows WSL only.
 
 ## Read first
 
-`tasks/todo.md` is the control plane — open work, and deferred work with the reason it
-was deferred. Read it before starting, so a decision that was already made deliberately
-does not get re-litigated.
+Read `KANBAN.md` after this file. It is the only short current-state panel.
+Short work is recorded by code, verification, and Git history. Use one
+`work/<id>/card.md` only for long, expensive, multi-session work that needs an
+exact resume point; record the question, frozen acceptance criteria, boundaries,
+resume pointer, and closure verdict. Do not create a task todo or journal.
 
 ## Commands
 
