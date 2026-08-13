@@ -20,6 +20,10 @@ Short work is recorded by code, verification, and Git history. Use one
 exact resume point; record the question, frozen acceptance criteria, boundaries,
 resume pointer, and closure verdict. Do not create a task todo or journal.
 
+`lessons.md` is the project-level store for durable prevention rules from user
+corrections. Read it only when relevant. Do not put current state, one-off
+evidence, or rules already owned by this file there.
+
 ## Commands
 
 ```sh

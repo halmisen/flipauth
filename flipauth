@@ -52,6 +52,9 @@ ACTIVE_MARKER="$STATE_DIR/.active-profile"
 # fields only — never tokens, headers, or unrelated response fields.
 QUOTA_CACHE="$STATE_DIR/.quota-cache.json"
 QUOTA_CACHE_SCHEMA=1
+PS_BIN="${FLIPAUTH_PS_BIN:-ps}"
+HERDR_BIN="${FLIPAUTH_HERDR_BIN:-herdr}"
+SWITCH_STOP_TIMEOUT="${FLIPAUTH_SWITCH_STOP_TIMEOUT:-8}"
 
 usage() {
   cat <<USAGE
@@ -176,14 +179,115 @@ load_profile_into_active() {
   done
 }
 
+# Herdr supplies lifecycle state for panes it owns, but the system process list is
+# the final authority.  Only an idle, positively identified matching pane receives
+# /exit; every other Claude/Codex process aborts before any credential write.
+_service_processes() {
+  "$PS_BIN" -eo pid=,ppid=,tty=,comm=,args= 2>/dev/null | python3 -c '
+import os, shlex, sys
+service = sys.argv[1]
+for raw in sys.stdin:
+    parts = raw.strip().split(None, 4)
+    if len(parts) < 4: continue
+    pid, ppid, tty, comm = parts[:4]
+    args = parts[4] if len(parts) == 5 else ""
+    try: first = os.path.basename(shlex.split(args)[0]) if args else ""
+    except ValueError: first = ""
+    if comm == service or first == service: print("\t".join((pid, ppid, tty, comm, args)))
+' "$SERVICE"
+}
+
+_herdr_agents() {
+  command -v "$HERDR_BIN" >/dev/null 2>&1 || return 0
+  local snapshot
+  snapshot="$("$HERDR_BIN" api snapshot 2>/dev/null)" || return 0
+  printf '%s' "$snapshot" | python3 -c '
+import json, sys
+try:
+    snap = json.load(sys.stdin)["result"]["snapshot"]
+    workspaces = {x.get("workspace_id"): x.get("label", x.get("workspace_id", "?")) for x in snap.get("workspaces", [])}
+    tabs = {x.get("tab_id"): x.get("label", x.get("tab_id", "?")) for x in snap.get("tabs", [])}
+except Exception: raise SystemExit(0)
+for row in snap.get("agents", []):
+    if isinstance(row, dict) and row.get("agent") == sys.argv[1]:
+        print("\t".join((str(row.get("pane_id", "?")), str(row.get("agent_status", "unknown")),
+                         str(workspaces.get(row.get("workspace_id"), row.get("workspace_id", "?"))),
+                         str(tabs.get(row.get("tab_id"), row.get("tab_id", "?"))))))
+' "$SERVICE"
+}
+
+_herdr_pane_service_pids() {
+  local pane="$1" info
+  info="$("$HERDR_BIN" pane process-info --pane "$pane" 2>/dev/null)" || return 1
+  printf '%s' "$info" | python3 -c '
+import json, os, sys
+try: rows = json.load(sys.stdin)["result"]["process_info"].get("foreground_processes", [])
+except Exception: raise SystemExit(1)
+for row in rows:
+    if not isinstance(row, dict): continue
+    argv = row.get("argv")
+    first = os.path.basename(argv[0]) if isinstance(argv, list) and argv and isinstance(argv[0], str) else ""
+    if row.get("name") == sys.argv[1] or first == sys.argv[1]:
+        if isinstance(row.get("pid"), int) and row["pid"] > 0: print(row["pid"])
+' "$SERVICE"
+}
+
+_print_running_processes() {
+  local rows="$1" pid ppid tty comm args
+  printf '\n%s is still running outside an idle Herdr pane:\n' "$LABEL" >&2
+  while IFS=$'\t' read -r pid ppid tty comm args; do
+    [[ -n "$pid" ]] || continue
+    printf '  pid: %s  ppid: %s  tty: %s\n  command: %s\n' "$pid" "$ppid" "$tty" "$args" >&2
+  done <<<"$rows"
+}
+
+ensure_cli_stopped_for_mutation() {
+  [[ "$SWITCH_STOP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] && (( SWITCH_STOP_TIMEOUT <= 60 )) || fail "FLIPAUTH_SWITCH_STOP_TIMEOUT must be an integer from 1 to 60"
+  local agents pane status workspace tab pids pid known="" rows unmanaged="" i
+  agents="$(_herdr_agents)"
+  while IFS=$'\t' read -r pane status workspace tab; do
+    [[ -n "$pane" ]] || continue
+    if [[ "$status" != idle ]]; then
+      printf '\nCannot switch %s profile.\n\n%s is still running in Herdr:\n  workspace: %s\n  tab: %s\n  status: %s\n\nNo credentials were modified.\nWait for the task to finish or exit %s first.\n' "$LABEL" "$LABEL" "$workspace" "$tab" "$status" "$SERVICE" >&2
+      return 1
+    fi
+    pids="$(_herdr_pane_service_pids "$pane")" || { printf '\nCannot switch %s profile: Herdr could not inspect idle pane %s.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1; }
+    while IFS= read -r pid; do [[ -n "$pid" ]] && known+=" $pid"; done <<<"$pids"
+  done <<<"$agents"
+  rows="$(_service_processes)"
+  while IFS=$'\t' read -r pid _; do
+    [[ -n "$pid" ]] || continue
+    [[ " $known " == *" $pid "* ]] || unmanaged+="$(printf '%s\n' "$rows" | awk -F '\t' -v p="$pid" '$1==p {print; exit}')"$'\n'
+  done <<<"$rows"
+  if [[ -n "$unmanaged" ]]; then _print_running_processes "$unmanaged"; printf 'No credentials were modified. Exit this %s process yourself, then retry.\n' "$SERVICE" >&2; return 1; fi
+
+  # This preserves the pane and its shell.  Sending /exit alone is never accepted as proof.
+  while IFS=$'\t' read -r pane status workspace tab; do
+    [[ -n "$pane" ]] || continue
+    pids="$(_herdr_pane_service_pids "$pane")"; [[ -n "$pids" ]] || continue
+    if ! "$HERDR_BIN" pane send-text "$pane" /exit >/dev/null 2>&1 || ! "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null 2>&1; then
+      printf '\nCannot switch %s profile: Herdr could not send /exit to %s.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1
+    fi
+  done <<<"$agents"
+  for ((i = 0; i < SWITCH_STOP_TIMEOUT * 10; i++)); do rows="$(_service_processes)"; [[ -z "$rows" ]] && break; sleep 0.1; done
+  if [[ -n "$rows" ]]; then _print_running_processes "$rows"; printf 'Timed out waiting for %s to exit. No credentials were modified.\n' "$SERVICE" >&2; return 1; fi
+  agents="$(_herdr_agents)"
+  while IFS=$'\t' read -r pane status workspace tab; do
+    [[ -n "$pane" ]] || continue
+    pids="$(_herdr_pane_service_pids "$pane")" || return 1
+    [[ -z "$pids" ]] || { printf '\nCannot switch %s profile: Herdr still reports %s in pane %s.\nNo credentials were modified.\n' "$LABEL" "$SERVICE" "$pane" >&2; return 1; }
+  done <<<"$agents"
+  rows="$(_service_processes)"; [[ -z "$rows" ]] || { _print_running_processes "$rows"; return 1; }
+}
+
 cmd_save() {
-  validate_profile_name "$1"; ensure_state_dir; validate_active
+  validate_profile_name "$1"; ensure_cli_stopped_for_mutation; ensure_state_dir; validate_active
   save_active_into "$1"; write_active_marker "$1"
   printf 'Saved active %s OAuth credentials as profile %s.\n' "$LABEL" "$1"
 }
 
 cmd_activate() {
-  validate_profile_name "$1"; ensure_state_dir; validate_profile_files "$1"
+  validate_profile_name "$1"; ensure_cli_stopped_for_mutation; ensure_state_dir; validate_profile_files "$1"
   local current=""
   if current="$(read_active_marker)"; then
     if [[ -f "${ACTIVE[0]}" ]]; then validate_active; save_active_into "$current"; fi
@@ -464,7 +568,7 @@ PY
 cmd_login() {
   [[ "$SERVICE" == claude ]] || fail "login is not supported for $SERVICE; use 'codex login' manually"
   local profile="$1"; shift
-  validate_profile_name "$profile"; ensure_state_dir
+  validate_profile_name "$profile"; ensure_cli_stopped_for_mutation; ensure_state_dir
   command -v claude >/dev/null 2>&1 || fail "claude command not found"
   local login_dir login_creds current=""
   login_dir="$(mktemp -d "$STATE_DIR/.login-$profile.XXXXXX")"
@@ -473,6 +577,7 @@ cmd_login() {
     rm -rf "$login_dir"; fail "Claude login did not complete"
   fi
   validate_claude_credentials "$login_creds"
+  if ! ensure_cli_stopped_for_mutation; then rm -rf "$login_dir"; return 1; fi
   atomic_copy "$login_creds" "$(profile_path "$profile" 0)"
   if current="$(read_active_marker)" && [[ "$current" == "$profile" ]]; then
     atomic_copy "$login_creds" "${ACTIVE[0]}"

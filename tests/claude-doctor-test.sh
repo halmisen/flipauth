@@ -3,6 +3,8 @@ set -euo pipefail
 
 BIN_DIR="${FLIPAUTH_BIN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/ps-empty"; chmod +x "$TMP/ps-empty"
+export FLIPAUTH_PS_BIN="$TMP/ps-empty" FLIPAUTH_HERDR_BIN="$TMP/no-herdr"
 fails=0
 check() { local desc="$1"; shift; if "$@"; then printf 'ok   - %s\n' "$desc"; else printf 'FAIL - %s\n' "$desc"; fails=$((fails+1)); fi; }
 

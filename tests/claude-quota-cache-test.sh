@@ -8,6 +8,8 @@ set -euo pipefail
 BIN_DIR="${FLIPAUTH_BIN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 TMP="$(mktemp -d)"
 STUB="$TMP/stub"; mkdir -p "$STUB"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/ps-empty"; chmod +x "$TMP/ps-empty"
+export FLIPAUTH_PS_BIN="$TMP/ps-empty" FLIPAUTH_HERDR_BIN="$TMP/no-herdr"
 cleanup() { [[ -n "${STUB_PID:-}" ]] && kill "$STUB_PID" 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 
