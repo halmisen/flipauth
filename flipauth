@@ -1157,9 +1157,9 @@ PY
 #     does not refresh tokens itself, it asks the connected client to do it and hand the
 #     new token back. We decline it, so no token rotation can occur on this path.
 #   - Windows are identified by `windowDurationMins`, never by the `primary`/`secondary`
-#     field names. Those names are ordinal, not semantic: until 2026-07 `primary` was the
-#     5-hour window, and it is now the 7-day one. Keying on the field name would silently
-#     mislabel the data the next time the backend's window set changes.
+#     field names. Those names are ordinal, not semantic. The current response contains
+#     both the 5-hour and 7-day windows, and keying on the field name would silently
+#     mislabel them if the backend changes their positions again.
 quota_codex() {
   local want="${1:-}" bin
   bin="${CODEX_SWITCH_CODEX_BIN:-codex}"
@@ -1325,12 +1325,16 @@ def rel(epoch):
     if h: return f"in {h}h{m:02d}m"
     return f"in {m}m"
 
+def rel_iso(text):
+    if not isinstance(text, str): return "—"
+    try: return rel(datetime.fromisoformat(text).timestamp())
+    except ValueError: return "—"
+
 # Allow-list the response into cache-shaped windows. Identity comes from the duration.
 def windows_of(snapshot):
     out = []
     if not isinstance(snapshot, dict): return out
-    for key in ("primary", "secondary"):
-        w = snapshot.get(key)
+    for w in snapshot.values():
         if not isinstance(w, dict): continue
         used = w.get("usedPercent")
         if not isinstance(used, (int, float)) or isinstance(used, bool): continue
@@ -1377,7 +1381,7 @@ for name, (auth_path, creds_path) in profiles.items():
     creds = credits_of(result)
     if creds: entry["reset_credits"] = creds
     samples[name] = entry
-    rows.append((mark, name, None, (wins, creds, snapshot.get("primary") or {}, snapshot.get("secondary") or {})))
+    rows.append((mark, name, None, (wins, creds)))
 
 def write_cache(new):
     if not new: return
@@ -1412,15 +1416,10 @@ flat = []
 for mark, name, err, data in rows:
     if err: flat.append((mark, name, err, "", ""))
     else:
-        wins, _creds, prim, sec = data
-        raw = {w.get("duration_minutes"): w for w in wins}
+        wins, _creds = data
         for w in wins:
-            resets_epoch = None
-            for src in (prim, sec):
-                if isinstance(src, dict) and src.get("windowDurationMins") == w.get("duration_minutes"):
-                    resets_epoch = src.get("resetsAt")
             flat.append((mark, name, label(w.get("duration_minutes")),
-                         f"{w['utilization']:.0f}%", rel(resets_epoch)))
+                         f"{w['utilization']:.0f}%", rel_iso(w.get("resets_at"))))
             mark, name = " ", ""
 
 w_name = max([len(r[1]) for r in flat] + [len("Profile")])

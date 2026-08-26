@@ -66,15 +66,19 @@ chmod +x "$TMP/codex"
 export CODEX_SWITCH_CODEX_BIN="$TMP/codex"
 export CODEX_SWITCH_QUOTA_TIMEOUT=15
 
-# body <primary pct> <primary window mins> <primary reset offset> <secondary json|null>
+# body <primary pct> <primary window mins> <primary reset offset>
+#      <secondary pct|null> <secondary window mins> <secondary reset offset>
 body() {
   python3 - "$STUB_DIR/body.json" "$@" <<'PY'
 import json, sys, time
 now = int(time.time())
+secondary = None if sys.argv[5] == "null" else {
+    "usedPercent": int(sys.argv[5]), "windowDurationMins": int(sys.argv[6]),
+    "resetsAt": now + int(sys.argv[7])}
 payload = {"rateLimits": {"limitId": "codex", "planType": "plus",
     "primary": {"usedPercent": int(sys.argv[2]), "windowDurationMins": int(sys.argv[3]),
                 "resetsAt": now + int(sys.argv[4])},
-    "secondary": json.loads(sys.argv[5])},
+    "secondary": secondary},
     "rateLimitResetCredits": {"availableCount": 1, "credits": [
         {"id": "c1", "resetType": "codexRateLimits", "status": "available",
          "grantedAt": now - 10, "expiresAt": now + 600000, "title": "Full reset"}]}}
@@ -83,7 +87,7 @@ PY
 }
 
 printf 'ok' > "$STUB_DIR/mode"
-body 73 10080 520000 null
+body 73 300 10000 41 10080 520000
 
 CX="$TMP/codex-home"; mkdir -p "$CX"; export CODEX_SWITCH_CODEX_DIR="$CX"
 STATE="$CX/oauth-accounts"; CACHE="$STATE/.quota-cache.json"
@@ -95,8 +99,10 @@ cp "$STATE/work.auth.json" "$TMP/snap-before.json"
 
 # ---------- 1. a successful read ----------
 OUT="$("$BIN_DIR/codex-switch" quota)"
-check "quota prints a window row" outputs "$OUT" '7d'
-check "quota prints the used percentage" outputs "$OUT" '73%'
+check "quota prints the 5h window row" outputs "$OUT" '5h'
+check "quota prints the 7d window row" outputs "$OUT" '7d'
+check "quota prints the 5h used percentage" outputs "$OUT" '73%'
+check "quota prints the 7d used percentage" outputs "$OUT" '41%'
 check "quota prints a reset countdown" outputs "$OUT" 'in [0-9]'
 check "quota marks the active profile" outputs "$OUT" '^\* alt'
 check "quota surfaces the reset credit" outputs "$OUT" 'Reset credits for .*: 1 available (expires 20'
@@ -104,10 +110,10 @@ check "quota creates the cache" test -f "$CACHE"
 check "cache is mode 600" mode_is "$CACHE" 600
 check "state dir stays mode 700" mode_is "$STATE" 700
 check "cache records the plan type" bash -c "python3 -c \"import json;raise SystemExit(0 if json.load(open('$CACHE'))['profiles']['alt']['plan_type']=='plus' else 1)\""
-check "cache keys the window by duration, not by field name" bash -c "python3 -c \"
+check "cache keys both windows by duration, not by field name" bash -c "python3 -c \"
 import json
 w=json.load(open('$CACHE'))['profiles']['alt']['windows']
-raise SystemExit(0 if len(w)==1 and w[0]['duration_minutes']==10080 else 1)\""
+raise SystemExit(0 if [x['duration_minutes'] for x in w]==[300,10080] else 1)\""
 check "cache distinguishes live from snapshot" bash -c "python3 -c \"
 import json
 d=json.load(open('$CACHE'))['profiles']
@@ -194,7 +200,9 @@ check "status starts no app-server" bash -c "test ! -s '$STUB_DIR/calls.log'"
 check "status keeps the active profile line" outputs "$STATUS" '^Active profile: alt$'
 check "status keeps the saved profiles line" outputs "$STATUS" '^Saved profiles: alt work$'
 check "status shows the cached value as a lower bound" outputs "$STATUS" '≥73%'
-check "status labels the window by duration" outputs "$STATUS" '7d'
+check "status shows the cached 7d value as a lower bound" outputs "$STATUS" '≥41%'
+check "status labels the 5h window by duration" outputs "$STATUS" '5h'
+check "status labels the 7d window by duration" outputs "$STATUS" '7d'
 check "status shows the sample age" outputs "$STATUS" 'just now\|ago'
 check "status shows the reset credit" outputs "$STATUS" 'Reset credits'
 
@@ -218,10 +226,10 @@ import json,sys
 rows={r['name']:r for r in json.load(sys.stdin)['profiles']}
 raise SystemExit(0 if rows['alt']['quota'] and rows['alt']['quota']['windows'] else 1)\"" "$JSON"
 check "codex --json names the value a lower bound" outputs "$JSON" 'utilization_at_least'
-check "codex --json labels and keys the window by duration" bash -c "printf '%s' \"\$0\" | python3 -c \"
+check "codex --json labels and keys both windows by duration" bash -c "printf '%s' \"\$0\" | python3 -c \"
 import json,sys
-w=json.load(sys.stdin)['profiles'][0]['quota']['windows'][0]
-raise SystemExit(0 if w['duration_minutes']==10080 and w['label']=='7d' else 1)\"" "$JSON"
+w=json.load(sys.stdin)['profiles'][0]['quota']['windows']
+raise SystemExit(0 if [(x['duration_minutes'],x['label']) for x in w]==[(300,'5h'),(10080,'7d')] else 1)\"" "$JSON"
 check "codex --json marks the elapsed window expired" bash -c "printf '%s' \"\$0\" | python3 -c \"
 import json,sys
 rows={r['name']:r for r in json.load(sys.stdin)['profiles']}

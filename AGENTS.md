@@ -165,13 +165,13 @@ There is no HTTP usage endpoint; the data is behind the JSON-RPC method
    drives a stub that issues the request and asserts flipauth answers with an error and
    never with a result. Do not "helpfully" implement that handler.
 3. *Windows are identified by `windowDurationMins`, never by `primary`/`secondary`.*
-   Those names are ordinal, not semantic: until 2026-07 `primary` was the 5-hour window;
-   it is now the 7-day one and `secondary` is null. Keying on the field name would
-   silently mislabel the data the next time the backend's window set changes. This is
-   also why the Codex cache holds a `windows` **list** keyed by duration rather than the
-   two fixed keys the Claude cache uses — the two services keep separate cache files
-   (they already live in separate state dirs) precisely so Claude's shape is not forced
-   onto Codex.
+   Those names are ordinal, not semantic. The current response reports both a 5-hour
+   window (`300` minutes) and a 7-day window (`10080` minutes), and their positions may
+   change again. Keying on the field name would silently mislabel the data. This is also
+   why the Codex cache holds a `windows` **list** keyed by duration rather than the two
+   fixed keys the Claude cache uses — the two services keep separate cache files (they
+   already live in separate state dirs) precisely so Claude's shape is not forced onto
+   Codex.
 
 `usedPercent` is on a 0-100 scale — verified empirically, not inferred from the name:
 `100.0` appears in recorded session history. `rateLimitResetCredits` from the same

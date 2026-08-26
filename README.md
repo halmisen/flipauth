@@ -271,8 +271,10 @@ endpoint to call. The data lives behind the JSON-RPC method `account/rateLimits/
 
 ```text
   Profile  window    used     resets
-* work         7d      3%   in 6d21h
-  other        7d     41%    in 4d2h
+* work         5h      3%    in 2h10m
+          7d     41%    in 6d21h
+  other        5h     12%    in 2h10m
+          7d     41%    in 4d2h
 * = active profile
 Reset credits for work: 1 available (expires 2026-08-13)
 ```
@@ -287,11 +289,11 @@ covered by tests:
   *server-to-client* request: the app-server does not refresh tokens itself, it asks the
   connected client to. flipauth answers it with an error, so a query can never rotate
   your credentials.
-- **Windows are identified by duration, never by field name.** The response labels
-  windows `primary` and `secondary`, but those names are ordinal rather than semantic —
-  until 2026-07 `primary` was the 5-hour window and it is now the 7-day one. flipauth
-  keys on `windowDurationMins`, so a change in the backend's window set relabels the
-  output honestly instead of silently mislabelling it.
+- **Windows are identified by duration, never by field name.** The response currently
+  reports both the 5-hour (`300` minutes) and 7-day (`10080` minutes) windows under
+  `primary` and `secondary`. Those names are ordinal rather than semantic. flipauth
+  keys on `windowDurationMins`, so the output shows `5h` and `7d` correctly if their
+  response positions change.
 
 However many windows the account has, each is reported with both its percentage and its
 reset countdown. `rateLimitResetCredits` — a free "full reset" some accounts are granted
@@ -735,8 +737,10 @@ flipauth 为每个配置各起一个 app-server 去问：
 
 ```text
   Profile  window    used     resets
-* work         7d      3%   in 6d21h
-  other        7d     41%    in 4d2h
+* work         5h      3%    in 2h10m
+          7d     41%    in 6d21h
+  other        5h     12%    in 1h04m
+          7d     41%    in 4d2h
 * = active profile
 Reset credits for work: 1 available (expires 2026-08-13)
 ```
@@ -749,9 +753,9 @@ Reset credits for work: 1 available (expires 2026-08-13)
 - **token 刷新是被拒绝的，不是被执行的。** `account/chatgptAuthTokens/refresh` 是一个
   **服务端向客户端**发起的请求——app-server 自己不刷新 token，它请求连接着的客户端去刷。
   flipauth 一律回错误，因此查询永远不会轮换你的凭据。
-- **窗口按时长识别，绝不按字段名识别。** 响应里的窗口叫 `primary` 和 `secondary`，但这两个
-  名字是序数而非语义——2026-07 之前 `primary` 是 5 小时窗口，现在是 7 天窗口。flipauth
-  以 `windowDurationMins` 为准，所以后端窗口集合变化时输出会如实改标签，而不是静默标错。
+- **窗口按时长识别，绝不按字段名识别。** 当前响应同时包含 5 小时（`300` 分钟）和 7 天
+  （`10080` 分钟）窗口，字段名 `primary` 和 `secondary` 只是序数，不代表窗口语义。
+  flipauth 以 `windowDurationMins` 为准，所以字段位置变化时仍会正确显示 `5h` 和 `7d`。
 
 账号有几个窗口就报几个，每个都同时给出百分比和重置倒计时。同一响应里的
 `rateLimitResetCredits`（部分账号会获赠的免费「完整重置」券）也会展示，过期时间按**本地
