@@ -6,6 +6,14 @@
 
 研究并支持 OMP（oh-my-pi）凭据切换。OMP OAuth 位于独立的 `~/.omp/agent/agent.db`，当前切换 `~/.claude/` 或 `~/.codex/` 不会影响 OMP；目标是让一次 `flipauth` 操作一致切换官方 CLI 与 OMP，但不能引入 API 中转站。
 
+## 已验证
+
+- 2026-09-08：已核实 Windows Codex 与 Claude 桌面版已安装；检查时两个 Windows 进程均未运行。
+- WSL 与 Windows Codex 使用各自的配置根；`doctor` 对 Windows Codex 凭据仅做读取和身份指纹比较，不写回 Windows 文件。
+- 当前 Windows Codex 身份与 WSL 保存的 profile 身份不一致；不能把 Windows 登录状态当作 WSL profile 的切换结果。
+- 工作树中的 Windows 边界保护会在写入或凭据复制前拒绝 Windows 受管路径、CLI 配置根错配、原生 Windows 二进制和 Windows 侧 Codex quota 临时目录；对应测试为 `tests/windows-boundary-test.sh`。
+- 隔离结论有运行条件：保持 CLI 配置根和临时目录在 WSL 文件系统内，并使用 WSL 版 `claude` / `codex`；边界测试通过后才可把保护视为发布保证。
+
 ## 下一步
 
 先研究 OMP `auth-broker` / `auth-gateway` 的真实机制，以及不同客户端签名的 refresh token 是否可转移；据此决定向 `can1357/oh-my-pi` 提 issue/PR，还是在 flipauth 增加受测扩展。

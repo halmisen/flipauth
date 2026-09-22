@@ -32,6 +32,7 @@ bash -n ./flipauth          # syntax check (lint equivalent)
 ./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
 ./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (79 checks)
 ./tests/codex-quota-test.sh          # codex app-server quota path (60 checks, stubbed)
+./tests/windows-boundary-test.sh     # refuses managed paths, binaries and TMPDIR on a Windows mount
 ```
 
 `quota` is the only command that reaches the network — for Claude over HTTP, for Codex by
@@ -46,6 +47,12 @@ mutated, and that a server-initiated token refresh is declined rather than answe
 Both suites compare the stub's call log before and after `status` / `status --json` /
 `observe` to prove those issue no request at all. Only a real end-to-end run still needs
 live credentials.
+
+`windows-boundary-test.sh` covers the WSL/Windows split. Nothing in the layout stops a
+managed path from resolving onto a Windows mount — every one of them comes from an
+overridable variable — so the script refuses that case, and these checks prove the refusal
+happens before any write. Its fake `findmnt` reports a Windows filesystem for one chosen
+prefix, so no case has to point at a real `/mnt` path to exercise the guard.
 
 Run a single test by invoking its script directly — tests are plain Bash with a `check`
 helper, not a framework. They drive the real script in an isolated `mktemp -d` sandbox by

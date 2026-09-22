@@ -418,6 +418,14 @@ If the variable is unset, `flipauth` attempts auto-detection via `wslvar` or `cm
 If detection fails, the field is reported as `not configured` and the comparison is
 skipped.
 
+This comparison is read-only. It does not activate, refresh, or overwrite the Windows
+credential. The normal switch commands manage the WSL-side CLI only. Before a command
+can write or copy credentials, `flipauth` refuses managed paths on a Windows filesystem.
+It also refuses a mutating command when `CODEX_HOME` / `CLAUDE_CONFIG_DIR` points at a
+different CLI root, and refuses Codex quota when its credential-copy temporary directory
+or selected binary is on the Windows side. These checks prevent an accidental path or
+environment override from crossing the WSL/Windows boundary.
+
 ## How it works
 
 - Profiles are stored under `~/.{claude,codex}/oauth-accounts/<profile>.<suffix>`.
@@ -431,6 +439,8 @@ skipped.
   `status` stays offline; only quota-shaped fields are stored, never tokens.
 - `observe` writes to that same cache from the payload Claude Code already pipes to your
   status line, so keeping it fresh costs no network request at all.
+- Managed paths, CLI roots, quota temporary directories, and quota binaries are checked
+  before use; paths that resolve to a Windows filesystem are refused.
 
 ## Environment variables
 
@@ -867,6 +877,12 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 若该变量未设置，`flipauth` 会尝试通过 `wslvar` 或 `cmd.exe` 自动探测。探测失败时，该字段
 显示为 `not configured`，并跳过对比。
 
+这个对比只有读取作用，不会激活、刷新或覆盖 Windows 侧凭据。普通切换命令只管理 WSL
+侧 CLI。任何命令在写入或复制凭据前，都会拒绝解析到 Windows 文件系统的受管路径；如果
+`CODEX_HOME` / `CLAUDE_CONFIG_DIR` 指向另一个 CLI 配置根，也会拒绝写入。Codex 配额查询
+还会拒绝 Windows 侧的临时目录或原生 Windows 二进制。这样即使环境变量或路径配置发生
+偏移，也不会静默跨过 WSL/Windows 边界。
+
 ## 工作原理
 
 - 配置保存在 `~/.{claude,codex}/oauth-accounts/<profile>.<suffix>`。
@@ -877,6 +893,8 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 - 激活配置时会先把即将切走的生效凭据重新保存，因此进行中的 token 刷新不会被悄悄丢失。
 - 成功的额度查询会缓存到同目录下的 `.quota-cache.json`，让 `status` 保持离线；缓存里只有额度相关字段，不含 token。
 - `observe` 从 Claude Code 本来就管道给状态栏的载荷里写进同一份缓存，因此保持新鲜完全不需要网络请求。
+- 所有受管路径、CLI 配置根、配额临时目录和配额二进制在使用前都会检查；解析到 Windows
+  文件系统时直接拒绝。
 
 ## 环境变量
 

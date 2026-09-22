@@ -13,6 +13,68 @@ PROG="$(basename "$0")"
 
 fail() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
 
+# --- Windows-filesystem guard -------------------------------------------------------
+# flipauth manages the WSL-side CLI only. Every managed path comes from an overridable
+# variable, so a path can resolve onto a Windows mount and make this script read or write
+# the Windows installation's credentials. The WSL process gate cannot see a Windows CLI
+# holding the old token, so that case must be refused outright rather than gated. The
+# check runs on the resolved path, never on the variable name.
+is_windows_path() {
+  local path probe fstype
+  path="$(realpath -m -- "$1" 2>/dev/null)" || return 1
+  # /mnt and /media are where WSL mounts the Windows drives, so treat them as Windows
+  # first. Asking findmnt about a path under a mount point that is not mounted yet would
+  # answer for the Linux directory holding it and wrongly call the path local.
+  case "$path" in /mnt|/mnt/*|/media|/media/*) return 0 ;; esac
+  # Anywhere else, the mount actually carrying the path decides. The path itself need not
+  # exist yet, so ask about its nearest existing ancestor.
+  probe="$path"
+  while [[ ! -e "$probe" && "$probe" != / ]]; do probe="$(dirname "$probe")"; done
+  fstype="$(findmnt -no FSTYPE --target "$probe" 2>/dev/null)" || return 1
+  case "$fstype" in drvfs|9p|virtiofs|cifs|smb3) return 0 ;; *) return 1 ;; esac
+}
+
+assert_not_windows_path() {
+  local what="$1" path="$2"
+  is_windows_path "$path" || return 0
+  fail "refusing to use $what on a Windows filesystem: $path
+flipauth manages the WSL-side CLI only; a managed path there would touch the Windows
+installation's credentials. Repoint it inside the WSL filesystem."
+}
+
+# The CLIs read a config-root variable when it is set. If it names a directory other than
+# the one flipauth manages, a switch writes a file the running CLI never reads, and the
+# user is told the switch succeeded. Refuse instead of switching into the void.
+assert_config_root_matches() {
+  local var val want have
+  if [[ "$SERVICE" == claude ]]; then var=CLAUDE_CONFIG_DIR; else var=CODEX_HOME; fi
+  val="${!var:-}"
+  [[ -n "$val" ]] || return 0
+  want="$(realpath -m -- "$DIR" 2>/dev/null)" || return 0
+  have="$(realpath -m -- "$val" 2>/dev/null)" || return 0
+  [[ "$want" == "$have" ]] && return 0
+  fail "$var is set to $val but flipauth manages $DIR.
+The $LABEL CLI would keep using $var, so this change would never reach it.
+Unset $var, or point the managed directory at the same path."
+}
+
+# A Windows-native executable writes the Windows installation's state and is invisible to
+# the WSL process gate, so it must not be driven from here.
+assert_native_binary() {
+  local what="$1" resolved
+  resolved="$(command -v "$2" 2>/dev/null)" || return 0
+  resolved="$(realpath -m -- "$resolved" 2>/dev/null)" || return 0
+  case "$resolved" in
+    *.exe|*.EXE|*.cmd|*.CMD|*.bat|*.BAT)
+      fail "$what resolves to a Windows executable: $resolved
+flipauth drives the WSL-side CLI only. Put the Linux build earlier in PATH." ;;
+  esac
+  if is_windows_path "$resolved"; then
+    fail "$what resolves to a binary on a Windows filesystem: $resolved
+flipauth drives the WSL-side CLI only. Put the Linux build earlier in PATH."
+  fi
+}
+
 case "$PROG" in
   claude-switch) SERVICE=claude ;;
   codex-switch)  SERVICE=codex ;;
@@ -55,6 +117,15 @@ QUOTA_CACHE_SCHEMA=1
 PS_BIN="${FLIPAUTH_PS_BIN:-ps}"
 HERDR_BIN="${FLIPAUTH_HERDR_BIN:-herdr}"
 SWITCH_STOP_TIMEOUT="${FLIPAUTH_SWITCH_STOP_TIMEOUT:-8}"
+
+# Guard every managed path before any command can act on one.
+assert_not_windows_path "the $LABEL state directory" "$STATE_DIR"
+assert_not_windows_path "the $LABEL active-profile marker" "$ACTIVE_MARKER"
+assert_not_windows_path "the $LABEL quota cache" "$QUOTA_CACHE"
+for _managed in "${ACTIVE[@]}"; do
+  assert_not_windows_path "a live $LABEL credential file" "$_managed"
+done
+unset _managed
 
 usage() {
   cat <<USAGE
@@ -281,13 +352,15 @@ ensure_cli_stopped_for_mutation() {
 }
 
 cmd_save() {
-  validate_profile_name "$1"; ensure_cli_stopped_for_mutation; ensure_state_dir; validate_active
+  validate_profile_name "$1"; assert_config_root_matches
+  ensure_cli_stopped_for_mutation; ensure_state_dir; validate_active
   save_active_into "$1"; write_active_marker "$1"
   printf 'Saved active %s OAuth credentials as profile %s.\n' "$LABEL" "$1"
 }
 
 cmd_activate() {
-  validate_profile_name "$1"; ensure_cli_stopped_for_mutation; ensure_state_dir; validate_profile_files "$1"
+  validate_profile_name "$1"; assert_config_root_matches
+  ensure_cli_stopped_for_mutation; ensure_state_dir; validate_profile_files "$1"
   local current=""
   if current="$(read_active_marker)"; then
     if [[ -f "${ACTIVE[0]}" ]]; then validate_active; save_active_into "$current"; fi
@@ -568,8 +641,10 @@ PY
 cmd_login() {
   [[ "$SERVICE" == claude ]] || fail "login is not supported for $SERVICE; use 'codex login' manually"
   local profile="$1"; shift
-  validate_profile_name "$profile"; ensure_cli_stopped_for_mutation; ensure_state_dir
+  validate_profile_name "$profile"; assert_config_root_matches
   command -v claude >/dev/null 2>&1 || fail "claude command not found"
+  assert_native_binary "the claude command" claude
+  ensure_cli_stopped_for_mutation; ensure_state_dir
   local login_dir login_creds current=""
   login_dir="$(mktemp -d "$STATE_DIR/.login-$profile.XXXXXX")"
   login_creds="$login_dir/.credentials.json"
@@ -1165,6 +1240,13 @@ quota_codex() {
   bin="${CODEX_SWITCH_CODEX_BIN:-codex}"
   command -v "$bin" >/dev/null 2>&1 ||
     fail "codex command not found; set CODEX_SWITCH_CODEX_BIN to its path"
+  assert_native_binary "the codex command" "$bin"
+  # The query copies a real credential into tempfile.mkdtemp(), which follows TMPDIR.
+  # Resolve it the way Python will rather than assuming /tmp.
+  local tmproot
+  tmproot="$(python3 -c 'import tempfile; print(tempfile.gettempdir())' 2>/dev/null)" ||
+    fail "could not resolve the temporary directory"
+  assert_not_windows_path "the temporary directory (TMPDIR)" "$tmproot"
   # Run the reader as a job so a signal aimed at flipauth reaches it. Without this the
   # Python child is merely orphaned: it keeps querying — with a credential copy on disk —
   # after the command the user killed has already exited.
