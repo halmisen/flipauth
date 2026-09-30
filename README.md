@@ -64,12 +64,16 @@ let you inspect the current state at any time.
 A live CLI process keeps tokens in memory. If you swap files while that process is
 still alive, it can write its old in-memory token back to disk and overwrite the
 profile you just activated. Before `save`, profile activation, or `login` writes a
-credential, flipauth scans the WSL process table. When Herdr is installed, an idle
-Claude/Codex pane with a matching foreground process receives `/exit` and Enter; its
-workspace, tab, pane, and shell stay in place. flipauth then waits for the PID to
-disappear and scans again. Working, blocked, unknown, uninspectable, or unmanaged
-sessions cause a safe abort. No credential file, saved snapshot, or active marker is
-changed until the matching CLI process count is zero.
+credential, flipauth scans the WSL process table. When Herdr is installed, flipauth
+submits `/exit` only to idle panes with a matching foreground process. It uses the
+pane command for Claude and Herdr's agent prompt command for each Codex pane, then
+waits for each Codex TUI to exit before acting on any daemon. The pane's workspace,
+tab, pane, and shell stay in place. For Codex only, it then sends SIGTERM to the exact
+managed app-server daemon and its `pid-update-loop` parent. It does not send SIGKILL.
+flipauth waits for the processes to disappear and scans again.
+Working, blocked, unknown, uninspectable, or other unmanaged sessions cause a safe
+abort. No credential file, saved snapshot, or active marker is changed until the
+matching CLI process count is zero.
 
 ## Install
 
@@ -457,13 +461,13 @@ environment override from crossing the WSL/Windows boundary.
 | `CLAUDE_SWITCH_API_BASE` | `https://api.anthropic.com` | Base URL for the Claude `quota` usage endpoint |
 | `CODEX_SWITCH_CODEX_BIN` | `codex` | Binary used to spawn the app-server for Codex `quota` |
 | `CODEX_SWITCH_QUOTA_TIMEOUT` | `40` | Seconds to wait for one Codex app-server reply |
-| `FLIPAUTH_SWITCH_STOP_TIMEOUT` | `8` | Seconds to wait after graceful Herdr `/exit` before aborting |
+| `FLIPAUTH_SWITCH_STOP_TIMEOUT` | `8` | Seconds to wait for each Herdr `/exit` and Codex daemon SIGTERM before aborting |
 
 ## Safety
 
 - flipauth refuses a credential mutation while the matching CLI is alive. It never stops the other service, Pi, OMP, shells, or a Herdr server.
-- An idle Herdr Claude/Codex pane may receive `/exit`; working, blocked, unknown, uninspectable, and non-Herdr processes require you to exit them yourself.
-- There is no force-stop mode. This is intentional: a guessed process state must never lead to killing active work.
+- An idle Herdr Claude pane may receive `/exit` through the pane command. Each idle Codex agent receives `/exit` through `herdr agent prompt`; flipauth waits for every Codex TUI to exit before signaling the exact managed app-server daemon and its updater parent with SIGTERM. No SIGKILL is sent. Working, blocked, unknown, uninspectable, and other non-Herdr processes require you to exit them yourself.
+- There is no general force-stop mode. If the managed Codex daemon does not exit before the timeout, flipauth aborts without changing credentials.
 - Save refreshed active credentials immediately after a new login.
 - Do not have the same OAuth account active in two places at once.
 - Do not hand-edit saved profile files unless you are deliberately repairing profiles.
@@ -550,10 +554,13 @@ Windows WSL。不支持也未测试 macOS 与原生 Windows。
 
 正在运行的 CLI 进程会把 token 保存在内存里。如果你在进程还活着的时候替换文件，它可能把
 内存里的旧 token 写回磁盘，覆盖你刚刚激活的配置。在 `save`、激活配置或 `login` 写入前，
-flipauth 会扫描整个 WSL 进程表。已安装 Herdr 时，只有前台进程已确认、状态为 `idle` 的同服务
-pane 会收到 `/exit` 和 Enter；workspace、tab、pane 与 shell 都会保留。随后 flipauth 会等待
-PID 消失并再次扫描。`working`、`blocked`、`unknown`、无法检查或 Herdr 外部的会话都会安全中止。
-在对应 CLI 进程数确认归零之前，不会修改 live credential、已保存快照或 active marker。
+flipauth 会扫描整个 WSL 进程表。已安装 Herdr 时，只有前台进程已确认、状态为 `idle` 的同服务 pane
+会收到 `/exit`。Claude 通过 pane 命令提交；Codex 逐个通过 `herdr agent prompt` 发送，并等待每个
+Codex TUI 退出后才处理 daemon。workspace、tab、pane 与 shell 都会保留。Codex 的精确 managed
+app-server daemon 和它的 `pid-update-loop` 父进程随后会收到 SIGTERM，不会收到 SIGKILL。随后
+flipauth 会等待 PID 消失并再次扫描。`working`、`blocked`、`unknown`、无法检查和其他 Herdr
+外部会话都会安全中止。在对应 CLI 进程数确认归零之前，不会修改 live credential、已保存快照
+或 active marker。
 
 ## 安装
 
@@ -593,7 +600,7 @@ flipauth claude save work
 # 2. 登录第二个账号并同样保存。
 flipauth claude login personal      # 直接登录并保存为命名配置
 
-# 3. 随时切换。flipauth 只会自行退出安全且 idle 的 Herdr Claude 会话。
+# 3. 随时切换。flipauth 会退出 idle Herdr 会话及精确匹配的 Codex managed daemon。
 flipauth claude personal
 claude
 
@@ -911,13 +918,13 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 | `CLAUDE_SWITCH_API_BASE` | `https://api.anthropic.com` | Claude `quota` 用量接口的基础 URL |
 | `CODEX_SWITCH_CODEX_BIN` | `codex` | Codex `quota` 启动 app-server 所用的二进制 |
 | `CODEX_SWITCH_QUOTA_TIMEOUT` | `40` | 等待单次 Codex app-server 响应的秒数 |
-| `FLIPAUTH_SWITCH_STOP_TIMEOUT` | `8` | Herdr 发送 `/exit` 后等待退出、超时即中止的秒数 |
+| `FLIPAUTH_SWITCH_STOP_TIMEOUT` | `8` | 等待每个 Herdr `/exit` 和 Codex daemon SIGTERM 后退出、超时即中止的秒数 |
 
 ## 安全须知
 
 - 对应 CLI 仍在运行时，flipauth 会拒绝写入凭据；它绝不会停止另一个服务、Pi、OMP、普通 shell 或整个 Herdr server。
-- 对状态为 `idle` 的 Herdr Claude/Codex pane，flipauth 可以发送 `/exit`；`working`、`blocked`、`unknown`、不可检查和 Herdr 外部进程都需要你自己退出。
-- 不提供 force-stop。这是有意的：状态不确定时，绝不能为了切换凭据而杀掉正在工作的 Agent。
+- 对状态为 `idle` 且前台进程已匹配的 Herdr Claude pane，flipauth 通过 pane 命令发送 `/exit`；Codex 则逐个通过 `herdr agent prompt` 发送，并等待所有 TUI 退出后才对精确 managed app-server daemon 及其 `pid-update-loop` 父进程发送 SIGTERM。不会发送 SIGKILL。`working`、`blocked`、`unknown`、不可检查和其他 Herdr 外部进程都需要你自己退出。
+- 不提供通用 force-stop。Codex daemon 若在等待期限内没有退出，flipauth 会中止切换且不改凭据。
 - 新登录后立即保存刷新过的生效凭据。
 - 不要让同一个 OAuth 账号同时在两处生效。
 - 除非有意修复配置，否则不要手动编辑已保存的配置文件。

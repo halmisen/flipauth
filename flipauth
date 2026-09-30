@@ -251,8 +251,9 @@ load_profile_into_active() {
 }
 
 # Herdr supplies lifecycle state for panes it owns, but the system process list is
-# the final authority.  Only an idle, positively identified matching pane receives
-# /exit; every other Claude/Codex process aborts before any credential write.
+# the final authority. Only an idle, positively identified matching pane receives
+# /exit. Codex's exact managed app-server daemon may receive SIGTERM; every other
+# unowned Claude/Codex process aborts before any credential write.
 _service_processes() {
   "$PS_BIN" -eo pid=,ppid=,tty=,comm=,args= 2>/dev/null | python3 -c '
 import os, shlex, sys
@@ -312,9 +313,60 @@ _print_running_processes() {
   done <<<"$rows"
 }
 
+_process_rows_for_pids() {
+  local wanted=" $1 " rows="$2" pid ppid tty comm args
+  wanted="${wanted//$'\n'/ }"
+  while IFS=$'\t' read -r pid ppid tty comm args; do
+    [[ -n "$pid" && " $wanted " == *" $pid "* ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$ppid" "$tty" "$comm" "$args"
+  done <<<"$rows"
+}
+
+_codex_managed_daemon_pids() {
+  python3 -c '
+import os, shlex, sys
+updaters = {}
+servers = []
+for raw in sys.stdin:
+    parts = raw.rstrip("\n").split("\t", 4)
+    if len(parts) != 5: continue
+    pid, ppid, tty, comm, args = parts
+    try: argv = shlex.split(args)
+    except ValueError: continue
+    if not argv or os.path.basename(argv[0]) != "codex": continue
+    command = argv[1:]
+    if command[:3] == ["app-server", "daemon", "pid-update-loop"]:
+        updaters[pid] = ppid
+        continue
+    if not command or command[0] != "app-server": continue
+    if "--remote-control" not in command or "--managed-daemon" not in command: continue
+    try: listen = command[command.index("--listen") + 1]
+    except (ValueError, IndexError): continue
+    if not listen.startswith("unix://"): continue
+    servers.append((pid, ppid))
+
+parents = {ppid for _, ppid in servers}
+for pid in sorted(pid for pid in updaters if pid in parents): print(pid)
+for pid, _ in sorted(servers, key=lambda row: int(row[0])): print(pid)
+'
+}
+
+_stop_codex_managed_daemon() {
+  local pids="$1" pid
+  [[ -n "$pids" ]] || return 0
+  printf '\nStopping the Codex managed app-server daemon with SIGTERM.\n' >&2
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    if ! kill -TERM "$pid" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
+      printf 'Cannot send SIGTERM to Codex managed app-server PID %s. No credentials were modified.\n' "$pid" >&2
+      return 1
+    fi
+  done <<<"$pids"
+}
+
 ensure_cli_stopped_for_mutation() {
   [[ "$SWITCH_STOP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] && (( SWITCH_STOP_TIMEOUT <= 60 )) || fail "FLIPAUTH_SWITCH_STOP_TIMEOUT must be an integer from 1 to 60"
-  local agents pane status workspace tab pids pid known="" rows unmanaged="" i
+  local agents current_agents pane status workspace tab pids pane_pids current_pane current_status current_workspace current_tab pid known="" rows unmanaged="" daemon_pids="" i
   agents="$(_herdr_agents)"
   while IFS=$'\t' read -r pane status workspace tab; do
     [[ -n "$pane" ]] || continue
@@ -326,20 +378,63 @@ ensure_cli_stopped_for_mutation() {
     while IFS= read -r pid; do [[ -n "$pid" ]] && known+=" $pid"; done <<<"$pids"
   done <<<"$agents"
   rows="$(_service_processes)"
+  if [[ "$SERVICE" == codex ]]; then daemon_pids="$(_codex_managed_daemon_pids <<<"$rows")"; fi
   while IFS=$'\t' read -r pid _; do
     [[ -n "$pid" ]] || continue
-    [[ " $known " == *" $pid "* ]] || unmanaged+="$(printf '%s\n' "$rows" | awk -F '\t' -v p="$pid" '$1==p {print; exit}')"$'\n'
+    [[ " $known " == *" $pid "* || $'\n'$daemon_pids$'\n' == *$'\n'$pid$'\n'* ]] || unmanaged+="$(printf '%s\n' "$rows" | awk -F '\t' -v p="$pid" '$1==p {print; exit}')"$'\n'
   done <<<"$rows"
   if [[ -n "$unmanaged" ]]; then _print_running_processes "$unmanaged"; printf 'No credentials were modified. Exit this %s process yourself, then retry.\n' "$SERVICE" >&2; return 1; fi
 
-  # This preserves the pane and its shell.  Sending /exit alone is never accepted as proof.
+  # Preflight every pane above before sending anything. Use Herdr's agent API for
+  # Codex so /exit reaches the TUI as an agent prompt, not shell input.
   while IFS=$'\t' read -r pane status workspace tab; do
     [[ -n "$pane" ]] || continue
-    pids="$(_herdr_pane_service_pids "$pane")"; [[ -n "$pids" ]] || continue
-    if ! "$HERDR_BIN" pane send-text "$pane" /exit >/dev/null 2>&1 || ! "$HERDR_BIN" pane send-keys "$pane" enter >/dev/null 2>&1; then
-      printf '\nCannot switch %s profile: Herdr could not send /exit to %s.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1
+    pids="$(_herdr_pane_service_pids "$pane")" || { printf '\nCannot switch %s profile: Herdr could not re-check pane %s before /exit.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1; }
+    [[ -n "$pids" ]] || continue
+    if [[ "$SERVICE" == codex ]]; then
+      current_agents="$(_herdr_agents)"
+      current_status=""
+      while IFS=$'\t' read -r current_pane current_status current_workspace current_tab; do
+        [[ "$current_pane" == "$pane" ]] && break
+        current_status=""
+      done <<<"$current_agents"
+      if [[ "$current_status" != idle ]]; then
+        printf '\nCannot switch %s profile: Codex agent in pane %s is no longer confirmed idle.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2
+        return 1
+      fi
+      if ! "$HERDR_BIN" agent prompt "$pane" /exit >/dev/null 2>&1; then
+        printf '\nCannot switch %s profile: Herdr could not send /exit to Codex agent in pane %s.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1
+      fi
+      for ((i = 0; i < SWITCH_STOP_TIMEOUT * 10; i++)); do
+        pane_pids="$(_herdr_pane_service_pids "$pane")" || { printf '\nCannot switch %s profile: Herdr could not re-check pane %s after /exit.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1; }
+        rows="$(_service_processes)"
+        if [[ -z "$pane_pids" ]] && [[ -z "$(_process_rows_for_pids "$pids" "$rows")" ]]; then break; fi
+        sleep 0.1
+      done
+      pane_pids="$(_herdr_pane_service_pids "$pane")" || { printf '\nCannot switch %s profile: Herdr could not re-check pane %s after /exit.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1; }
+      rows="$(_service_processes)"
+      if [[ -n "$pane_pids" || -n "$(_process_rows_for_pids "$pids" "$rows")" ]]; then
+        printf '\nTimed out waiting for Codex agent in pane %s to exit. No credentials were modified.\n' "$pane" >&2
+        _print_running_processes "$(_process_rows_for_pids "$pids" "$rows")"
+        return 1
+      fi
+    elif ! "$HERDR_BIN" pane run "$pane" /exit >/dev/null 2>&1; then
+      printf '\nCannot switch %s profile: Herdr could not submit /exit to %s.\nNo credentials were modified.\n' "$LABEL" "$pane" >&2; return 1
     fi
   done <<<"$agents"
+
+  # Re-scan after the TUI panes exit. Only now may the exact Codex daemon pair
+  # be signalled; any new or unowned Codex process aborts before credential writes.
+  rows="$(_service_processes)"
+  if [[ "$SERVICE" == codex ]]; then daemon_pids="$(_codex_managed_daemon_pids <<<"$rows")"; fi
+  unmanaged=""
+  while IFS=$'\t' read -r pid _; do
+    [[ -n "$pid" ]] || continue
+    [[ $'\n'$daemon_pids$'\n' == *$'\n'$pid$'\n'* ]] || unmanaged+="$(printf '%s\n' "$rows" | awk -F '\t' -v p="$pid" '$1==p {print; exit}')"$'\n'
+  done <<<"$rows"
+  if [[ -n "$unmanaged" ]]; then _print_running_processes "$unmanaged"; printf 'No credentials were modified. Exit this %s process yourself, then retry.\n' "$SERVICE" >&2; return 1; fi
+  if [[ -n "$daemon_pids" ]]; then _stop_codex_managed_daemon "$daemon_pids" || return 1; fi
+
   for ((i = 0; i < SWITCH_STOP_TIMEOUT * 10; i++)); do rows="$(_service_processes)"; [[ -z "$rows" ]] && break; sleep 0.1; done
   if [[ -n "$rows" ]]; then _print_running_processes "$rows"; printf 'Timed out waiting for %s to exit. No credentials were modified.\n' "$SERVICE" >&2; return 1; fi
   agents="$(_herdr_agents)"
