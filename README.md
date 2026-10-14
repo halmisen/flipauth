@@ -69,11 +69,17 @@ submits `/exit` only to idle panes with a matching foreground process. It uses t
 pane command for Claude and Herdr's agent prompt command for each Codex pane, then
 waits for each Codex TUI to exit before acting on any daemon. The pane's workspace,
 tab, pane, and shell stay in place. For Codex only, it then sends SIGTERM to the exact
-managed app-server daemon and its `pid-update-loop` parent. It does not send SIGKILL.
+managed app-server daemon and its `pid-update-loop` helper. Official PID records,
+process start identity, and the configuration root must all match; a parent-child
+relationship is not required. It does not send SIGKILL.
 flipauth waits for the processes to disappear and scans again.
 Working, blocked, unknown, uninspectable, or other unmanaged sessions cause a safe
 abort. No credential file, saved snapshot, or active marker is changed until the
 matching CLI process count is zero.
+
+For personal terminal use, start `codex --no-daemon` to avoid the shared background
+server. This does not stop an already-running daemon. flipauth does not restart
+a daemon or remote-control after switching; start a fresh terminal session.
 
 ## Install
 
@@ -466,7 +472,7 @@ environment override from crossing the WSL/Windows boundary.
 ## Safety
 
 - flipauth refuses a credential mutation while the matching CLI is alive. It never stops the other service, Pi, OMP, shells, or a Herdr server.
-- An idle Herdr Claude pane may receive `/exit` through the pane command. Each idle Codex agent receives `/exit` through `herdr agent prompt`; flipauth waits for every Codex TUI to exit before signaling the exact managed app-server daemon and its updater parent with SIGTERM. No SIGKILL is sent. Working, blocked, unknown, uninspectable, and other non-Herdr processes require you to exit them yourself.
+- An idle Herdr Claude pane may receive `/exit` through the pane command. Each idle Codex agent receives `/exit` through `herdr agent prompt`; flipauth waits for every Codex TUI to exit before signaling the exact managed app-server daemon and its updater helper with SIGTERM. No SIGKILL is sent. Working, blocked, unknown, uninspectable, and other non-Herdr processes require you to exit them yourself.
 - There is no general force-stop mode. If the managed Codex daemon does not exit before the timeout, flipauth aborts without changing credentials.
 - Save refreshed active credentials immediately after a new login.
 - Do not have the same OAuth account active in two places at once.
@@ -557,10 +563,14 @@ Windows WSL。不支持也未测试 macOS 与原生 Windows。
 flipauth 会扫描整个 WSL 进程表。已安装 Herdr 时，只有前台进程已确认、状态为 `idle` 的同服务 pane
 会收到 `/exit`。Claude 通过 pane 命令提交；Codex 逐个通过 `herdr agent prompt` 发送，并等待每个
 Codex TUI 退出后才处理 daemon。workspace、tab、pane 与 shell 都会保留。Codex 的精确 managed
-app-server daemon 和它的 `pid-update-loop` 父进程随后会收到 SIGTERM，不会收到 SIGKILL。随后
+app-server daemon 和它的 `pid-update-loop` 辅助进程随后会收到 SIGTERM，不会收到 SIGKILL。
+必须匹配官方 PID 记录、进程启动标识与配置根；不依赖父子关系。随后
 flipauth 会等待 PID 消失并再次扫描。`working`、`blocked`、`unknown`、无法检查和其他 Herdr
 外部会话都会安全中止。在对应 CLI 进程数确认归零之前，不会修改 live credential、已保存快照
 或 active marker。
+
+个人终端使用建议运行 `codex --no-daemon`，避免共享后台服务；该选项不会停止已经运行的 daemon。
+flipauth 切换后不自动恢复 daemon 或 remote-control，直接启动新的终端会话即可。
 
 ## 安装
 
@@ -923,7 +933,7 @@ export CODEX_SWITCH_WINDOWS_AUTH="/mnt/c/Users/<YourWindowsUser>/.codex/auth.jso
 ## 安全须知
 
 - 对应 CLI 仍在运行时，flipauth 会拒绝写入凭据；它绝不会停止另一个服务、Pi、OMP、普通 shell 或整个 Herdr server。
-- 对状态为 `idle` 且前台进程已匹配的 Herdr Claude pane，flipauth 通过 pane 命令发送 `/exit`；Codex 则逐个通过 `herdr agent prompt` 发送，并等待所有 TUI 退出后才对精确 managed app-server daemon 及其 `pid-update-loop` 父进程发送 SIGTERM。不会发送 SIGKILL。`working`、`blocked`、`unknown`、不可检查和其他 Herdr 外部进程都需要你自己退出。
+- 对状态为 `idle` 且前台进程已匹配的 Herdr Claude pane，flipauth 通过 pane 命令发送 `/exit`；Codex 则逐个通过 `herdr agent prompt` 发送，并等待所有 TUI 退出后才对精确 managed app-server daemon 及其 `pid-update-loop` 辅助进程发送 SIGTERM。不会发送 SIGKILL。`working`、`blocked`、`unknown`、不可检查和其他 Herdr 外部进程都需要你自己退出。
 - 不提供通用 force-stop。Codex daemon 若在等待期限内没有退出，flipauth 会中止切换且不改凭据。
 - 新登录后立即保存刷新过的生效凭据。
 - 不要让同一个 OAuth 账号同时在两处生效。

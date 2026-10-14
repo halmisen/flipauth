@@ -324,9 +324,28 @@ _process_rows_for_pids() {
 
 _codex_managed_daemon_pids() {
   python3 -c '
-import os, shlex, sys
-updaters = {}
-servers = []
+import json, os, pathlib, shlex, sys
+# The official PID records establish ownership even when the server and updater
+# are siblings, or have been reparented after a TUI exits. Pin process identity,
+# not just a PID or a coincidental parent relationship.
+root = pathlib.Path(sys.argv[1]).resolve()
+records = {}
+for name, kind in (("daemon.pid", "server"), ("daemon-updater.pid", "updater"),
+                   ("app-server.pid", "server"), ("app-server-updater.pid", "updater")):
+    try:
+        record = json.loads((root / "app-server-daemon" / name).read_text())
+        pid = record["pid"]
+        if type(pid) is not int or pid <= 1: continue
+        identity = record["processIdentity"]
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        if stat[0] == "Z" or int(stat[19]) != identity["startTicks"]: continue
+        if pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip() != identity["bootId"]: continue
+        env = dict(x.split(b"=", 1) for x in pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0") if b"=" in x)
+        home = env.get(b"CODEX_HOME") or env.get(b"HOME", b"") + b"/.codex"
+        if pathlib.Path(os.fsdecode(home)).resolve() != root: continue
+        records[str(pid)] = kind
+    except (OSError, ValueError, KeyError, TypeError): continue
+updaters, servers = [], []
 for raw in sys.stdin:
     parts = raw.rstrip("\n").split("\t", 4)
     if len(parts) != 5: continue
@@ -335,28 +354,32 @@ for raw in sys.stdin:
     except ValueError: continue
     if not argv or os.path.basename(argv[0]) != "codex": continue
     command = argv[1:]
-    if command[:3] == ["app-server", "daemon", "pid-update-loop"]:
-        updaters[pid] = ppid
+    if command[:3] == ["app-server", "daemon", "pid-update-loop"] and records.get(pid) == "updater":
+        updaters.append(pid)
         continue
     if not command or command[0] != "app-server": continue
-    if "--remote-control" not in command or "--managed-daemon" not in command: continue
+    if "--managed-daemon" not in command or records.get(pid) != "server": continue
     try: listen = command[command.index("--listen") + 1]
     except (ValueError, IndexError): continue
     if not listen.startswith("unix://"): continue
-    servers.append((pid, ppid))
-
-parents = {ppid for _, ppid in servers}
-for pid in sorted(pid for pid in updaters if pid in parents): print(pid)
-for pid, _ in sorted(servers, key=lambda row: int(row[0])): print(pid)
-'
+    servers.append(pid)
+if servers:
+    for pid in sorted(updaters, key=int): print(pid)
+    for pid in sorted(servers, key=int): print(pid)
+' "$DIR"
 }
 
 _stop_codex_managed_daemon() {
-  local pids="$1" pid
+  local pids="$1" pid fresh
   [[ -n "$pids" ]] || return 0
   printf '\nStopping the Codex managed app-server daemon with SIGTERM.\n' >&2
   while IFS= read -r pid; do
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    fresh="$(_codex_managed_daemon_pids <<<"$(_service_processes)")"
+    if [[ $'\n'$fresh$'\n' != *$'\n'$pid$'\n'* ]]; then
+      printf 'Codex daemon PID %s no longer has verified ownership. No credentials were modified.\n' "$pid" >&2
+      return 1
+    fi
     if ! kill -TERM "$pid" 2>/dev/null && kill -0 "$pid" 2>/dev/null; then
       printf 'Cannot send SIGTERM to Codex managed app-server PID %s. No credentials were modified.\n' "$pid" >&2
       return 1
@@ -467,7 +490,7 @@ cmd_activate() {
   fi
   load_profile_into_active "$1"; write_active_marker "$1"
   if [[ "$SERVICE" == codex ]]; then
-    printf 'Activated Codex OAuth profile %s. Start a fresh codex process for this account.\n' "$1"
+    printf 'Activated Codex OAuth profile %s. Start a fresh session with: codex --no-daemon\n' "$1"
   else
     printf 'Activated Claude OAuth profile %s.\n' "$1"
   fi

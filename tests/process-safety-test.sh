@@ -84,15 +84,16 @@ elif mode.startswith('idle-'):
             try: state = pathlib.Path(f'/proc/{pid}/stat').read_text().split()[2]
             except (FileNotFoundError, IndexError): continue
             if state != 'Z': print(f'{pid} {ppid} ? codex {args}')
-elif mode == 'managed-daemon-codex':
+elif mode in ('managed-daemon-codex', 'managed-siblings-codex', 'managed-local-codex'):
     import pathlib
     for key, ppid, args in (
-        ('DAEMON_UPDATER_PID', '1', '/opt/codex app-server daemon pid-update-loop'),
-        ('DAEMON_SERVER_PID', os.environ['DAEMON_UPDATER_PID'], '/opt/codex app-server --remote-control --listen unix:// --managed-daemon'),
+        ('DAEMON_UPDATER_PID', '99' if mode == 'managed-siblings-codex' else '1', '/opt/codex app-server daemon pid-update-loop'),
+        ('DAEMON_SERVER_PID', '99' if mode == 'managed-siblings-codex' else os.environ['DAEMON_UPDATER_PID'], '/opt/codex app-server --remote-control --listen unix:// --managed-daemon'),
     ):
         pid = os.environ[key]
         try: state = pathlib.Path(f'/proc/{pid}/stat').read_text().split()[2]
         except (FileNotFoundError, IndexError): continue
+        if mode == 'managed-local-codex': args = args.replace('--remote-control ', '')
         if state != 'Z': print(f'{pid} {ppid} ? codex {args}')
 elif mode == 'isolation':
     if not (root / 'exited.pane-claude').exists(): print('123 1 pts/9 claude claude --fixture')
@@ -111,6 +112,23 @@ setup_codex() {
   CX="$TMP/codex"; rm -rf "$CX"; mkdir -p "$CX"; export CODEX_SWITCH_CODEX_DIR="$CX"; set_mode none
   printf '%s' '{"tokens":{"access_token":"one"}}' > "$CX/auth.json"; "$BIN_DIR/codex-switch" save one >/dev/null
   printf '%s' '{"tokens":{"access_token":"two"}}' > "$CX/auth.json"; "$BIN_DIR/codex-switch" save two >/dev/null
+}
+start_daemon_fixture() {
+  CODEX_HOME="${1:-$CX}" sleep 60 & DAEMON_UPDATER_PID=$!
+  CODEX_HOME="${1:-$CX}" sleep 60 & DAEMON_SERVER_PID=$!
+  export DAEMON_UPDATER_PID DAEMON_SERVER_PID
+  python3 - "$CX" <<'PY'
+import json, os, pathlib, sys
+root=pathlib.Path(sys.argv[1])/'app-server-daemon'; root.mkdir(exist_ok=True)
+for key, name in [('DAEMON_UPDATER_PID','daemon-updater.pid'),('DAEMON_SERVER_PID','daemon.pid')]:
+    pid=int(os.environ[key]); ticks=int(pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19])
+    (root/name).write_text(json.dumps({'pid':pid,'processIdentity':{'startTicks':ticks,'bootId':pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()}}))
+PY
+}
+finish_daemon_fixture() {
+  kill -TERM "$DAEMON_UPDATER_PID" "$DAEMON_SERVER_PID" 2>/dev/null || true
+  wait "$DAEMON_UPDATER_PID" 2>/dev/null || true; wait "$DAEMON_SERVER_PID" 2>/dev/null || true
+  DAEMON_UPDATER_PID=""; DAEMON_SERVER_PID=""; export DAEMON_UPDATER_PID DAEMON_SERVER_PID
 }
 snapshot_claude() { cp "$CL/.credentials.json" "$TMP/live-before"; cp "$CL/oauth-accounts/two.credentials.json" "$TMP/saved-before"; cp "$CL/oauth-accounts/.active-profile" "$TMP/marker-before"; }
 
@@ -131,23 +149,37 @@ check "every idle Codex agent receives /exit separately before switching" bash -
 setup_codex; set_mode idle-second-stubborn-codex; cp "$CX/auth.json" "$TMP/codex-live-before"; cp "$CX/oauth-accounts/two.auth.json" "$TMP/codex-saved-before"; cp "$CX/oauth-accounts/.active-profile" "$TMP/codex-marker-before"
 check "a Codex pane stuck after /exit aborts before changing credentials" bash -c "! '$BIN_DIR/codex-switch' one >/dev/null 2>&1 && grep -qx 'agent-prompt pane-codex-1 /exit' '$SAFETY_FIXTURE/calls' && grep -qx 'agent-prompt pane-codex-2 /exit' '$SAFETY_FIXTURE/calls' && cmp -s '$CX/auth.json' '$TMP/codex-live-before' && cmp -s '$CX/oauth-accounts/two.auth.json' '$TMP/codex-saved-before' && cmp -s '$CX/oauth-accounts/.active-profile' '$TMP/codex-marker-before'"
 setup_codex; set_mode idle-codex-managed-daemon
-sleep 60 & DAEMON_UPDATER_PID=$!
-sleep 60 & DAEMON_SERVER_PID=$!
-export DAEMON_UPDATER_PID DAEMON_SERVER_PID
+start_daemon_fixture
 TEST_DAEMON_UPDATER_PID="$DAEMON_UPDATER_PID"; TEST_DAEMON_SERVER_PID="$DAEMON_SERVER_PID"
 "$BIN_DIR/codex-switch" one >/dev/null
 wait "$DAEMON_UPDATER_PID" 2>/dev/null || true; wait "$DAEMON_SERVER_PID" 2>/dev/null || true
 DAEMON_UPDATER_PID=""; DAEMON_SERVER_PID=""; export DAEMON_UPDATER_PID DAEMON_SERVER_PID
 check "Codex TUI exits before its managed daemon receives SIGTERM" bash -c "grep -qx 'agent-prompt pane-codex /exit daemon-alive=true' '$SAFETY_FIXTURE/calls' && ! kill -0 '$TEST_DAEMON_UPDATER_PID' 2>/dev/null && ! kill -0 '$TEST_DAEMON_SERVER_PID' 2>/dev/null && grep -q one '$CX/auth.json'"
 setup_codex; set_mode managed-daemon-codex
-sleep 60 & DAEMON_UPDATER_PID=$!
-sleep 60 & DAEMON_SERVER_PID=$!
-export DAEMON_UPDATER_PID DAEMON_SERVER_PID
+start_daemon_fixture
 TEST_DAEMON_UPDATER_PID="$DAEMON_UPDATER_PID"; TEST_DAEMON_SERVER_PID="$DAEMON_SERVER_PID"
 "$BIN_DIR/codex-switch" one >/dev/null
 wait "$DAEMON_UPDATER_PID" 2>/dev/null || true; wait "$DAEMON_SERVER_PID" 2>/dev/null || true
 DAEMON_UPDATER_PID=""; DAEMON_SERVER_PID=""; export DAEMON_UPDATER_PID DAEMON_SERVER_PID
 check "exact Codex managed daemon pair receives SIGTERM before switching" bash -c "! kill -0 '$TEST_DAEMON_UPDATER_PID' 2>/dev/null && ! kill -0 '$TEST_DAEMON_SERVER_PID' 2>/dev/null && grep -q one '$CX/auth.json'"
+setup_codex; set_mode managed-siblings-codex; start_daemon_fixture
+check "official sibling daemon and updater exit before a personal credential switch" bash -c "'$BIN_DIR/codex-switch' one >'$TMP/sibling.out' 2>&1 && grep -q one '$CX/auth.json' && grep -qx one '$CX/oauth-accounts/.active-profile' && ! kill -0 '$DAEMON_UPDATER_PID' 2>/dev/null && ! kill -0 '$DAEMON_SERVER_PID' 2>/dev/null"
+finish_daemon_fixture
+setup_codex; set_mode managed-local-codex; start_daemon_fixture
+check "local daemon without remote-control exits before switching" bash -c "'$BIN_DIR/codex-switch' one >'$TMP/local.out' 2>&1 && grep -q one '$CX/auth.json' && ! kill -0 '$DAEMON_UPDATER_PID' 2>/dev/null && ! kill -0 '$DAEMON_SERVER_PID' 2>/dev/null"
+finish_daemon_fixture
+setup_codex; set_mode managed-siblings-codex; start_daemon_fixture
+python3 - "$CX/app-server-daemon/daemon-updater.pid" <<'PY'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); d=json.loads(p.read_text()); d['processIdentity']['startTicks']+=1; p.write_text(json.dumps(d))
+PY
+cp "$CX/auth.json" "$TMP/codex-live-before"; cp "$CX/oauth-accounts/two.auth.json" "$TMP/codex-saved-before"; cp "$CX/oauth-accounts/.active-profile" "$TMP/codex-marker-before"
+check "stale official PID identity refuses without signalling or credential mutation" bash -c "! '$BIN_DIR/codex-switch' one >/dev/null 2>&1 && kill -0 '$DAEMON_UPDATER_PID' && kill -0 '$DAEMON_SERVER_PID' && cmp -s '$CX/auth.json' '$TMP/codex-live-before' && cmp -s '$CX/oauth-accounts/two.auth.json' '$TMP/codex-saved-before' && cmp -s '$CX/oauth-accounts/.active-profile' '$TMP/codex-marker-before'"
+finish_daemon_fixture
+setup_codex; set_mode managed-siblings-codex; start_daemon_fixture "$TMP/other-codex"
+cp "$CX/auth.json" "$TMP/codex-live-before"
+check "daemon from another configuration root refuses without signalling or writing" bash -c "! '$BIN_DIR/codex-switch' one >/dev/null 2>&1 && kill -0 '$DAEMON_UPDATER_PID' && kill -0 '$DAEMON_SERVER_PID' && cmp -s '$CX/auth.json' '$TMP/codex-live-before'"
+finish_daemon_fixture
 setup_codex; set_mode working-codex; cp "$CX/auth.json" "$TMP/codex-live-before"; cp "$CX/oauth-accounts/two.auth.json" "$TMP/codex-saved-before"; cp "$CX/oauth-accounts/.active-profile" "$TMP/codex-marker-before"
 check "working Herdr Codex refuses without mutation" bash -c "! '$BIN_DIR/codex-switch' one >/dev/null 2>&1 && cmp -s '$CX/auth.json' '$TMP/codex-live-before' && cmp -s '$CX/oauth-accounts/two.auth.json' '$TMP/codex-saved-before' && cmp -s '$CX/oauth-accounts/.active-profile' '$TMP/codex-marker-before'"
 
