@@ -31,6 +31,13 @@ Herdr 联系规则归 Harness 全局指令：工具 shell 缺少 `HERDR_ENV` 不
 `/exit`，且所有 TUI 退出后才停止 managed daemon。不要用 `herdr server stop` 作为该验收的替代，
 因为它会停止同一 server 的无关工作。
 
+### 改进候选（来源：2026-10-26 只读审视，未实施，按优先级）
+
+1. 加 `tests/run-all.sh` 自动发现并汇总全部套件：`AGENTS.md:28-35` 漏列 `tests/process-safety-test.sh`，`AGENTS.md:9`/`:34` 的行数与检查数已过期。
+2. 用户确认 10-09 个人 Codex 切换 review 是否完成，再改写上方「下一步」：所述改动已在 `ff61ef3`、`35f9390` 提交，本面板无 review 结论。
+3. 加只读预检 `flipauth <svc> <profile> --dry-run [--json]`，在不发 `/exit`、不写凭据的前提下对真实 Herdr 核对闸门判定：`flipauth:390-471`，假 herdr 结构见 `tests/process-safety-test.sh:20-60`。
+4. Claude 分支在 `pane run /exit` 前补 idle 复查，与 Codex 分支一致（推断风险，先问作者）：`flipauth:418-428` 对比 `flipauth:442`。
+
 ## 边界
 
 - 不把真实账号标签、机器路径、用量数字、token 或凭据数据库写入 Git。
