@@ -1,217 +1,128 @@
 # AGENTS.md
 
-Project rules for any coding agent working in this repository (Claude Code,
-Codex, and others). Provider-specific overlays live in `CLAUDE.md` / `CODEX.md`
-and sit below this file.
+Project rules for Claude Code, Codex and other coding agents. Read `KANBAN.md` next;
+it is the only short current-state panel. Provider overlays sit below this file.
 
 ## What This Is
 
-`flipauth` is a single self-contained Bash script (`./flipauth`, ~910 lines) that swaps
-saved OAuth login profiles for the official Claude Code CLI and the official Codex CLI.
-There is no build step, no dependencies to install, and no package manifest — the only
-runtime requirements are `bash` and `python3` (used for JSON validation and credential
-inspection). Target platform is Windows WSL only.
-
-## Read first
-
-Read `KANBAN.md` after this file. It is the only short current-state panel.
-Short work is recorded by code, verification, and Git history. Use one
-`work/<id>/card.md` only for long, expensive, multi-session work that needs an
-exact resume point; record the question, frozen acceptance criteria, boundaries,
-resume pointer, and closure verdict. Do not create a task todo or journal.
-
-`lessons.md` is the project-level store for durable prevention rules from user
-corrections. Read it only when relevant. Do not put current state, one-off
-evidence, or rules already owned by this file there.
-
-## Commands
-
-```sh
-bash -n ./flipauth          # syntax check (lint equivalent)
-./tests/parity-test.sh      # full save/activate/status/doctor coverage for both services
-./tests/claude-doctor-test.sh   # Claude doctor output + token-leak assertions
-./tests/claude-quota-cache-test.sh   # quota cache, observe, status --json (79 checks)
-./tests/codex-quota-test.sh          # codex app-server quota path (60 checks, stubbed)
-./tests/windows-boundary-test.sh     # refuses managed paths, binaries and TMPDIR on a Windows mount
-```
-
-`quota` is the only command that reaches the network — for Claude over HTTP, for Codex by
-spawning `codex app-server`. Both are stubbed, so the whole suite runs offline.
-
-`claude-quota-cache-test.sh` starts a local `http.server` and points
-`CLAUDE_SWITCH_API_BASE` at it, which also drives the 401/429/connection-failure paths
-deterministically. `codex-quota-test.sh` substitutes a fake app-server via
-`CODEX_SWITCH_CODEX_BIN` and uses it to assert the things a live account cannot show:
-that each profile is read from a throwaway `CODEX_HOME`, that snapshots are never
-mutated, and that a server-initiated token refresh is declined rather than answered.
-Both suites compare the stub's call log before and after `status` / `status --json` /
-`observe` to prove those issue no request at all. Only a real end-to-end run still needs
-live credentials.
-
-`windows-boundary-test.sh` covers the WSL/Windows split. Nothing in the layout stops a
-managed path from resolving onto a Windows mount — every one of them comes from an
-overridable variable — so the script refuses that case, and these checks prove the refusal
-happens before any write. Its fake `findmnt` reports a Windows filesystem for one chosen
-prefix, so no case has to point at a real `/mnt` path to exercise the guard.
-
-Run a single test by invoking its script directly — tests are plain Bash with a `check`
-helper, not a framework. They drive the real script in an isolated `mktemp -d` sandbox by
-overriding `CLAUDE_SWITCH_CLAUDE_DIR` / `CODEX_SWITCH_CODEX_DIR`, so they never touch your
-real `~/.claude` or `~/.codex`. Override the script under test with `FLIPAUTH_BIN_DIR`.
-
-The script invokes itself under different names via the `claude-switch` / `codex-switch`
-symlinks in the repo root; tests call those symlinks directly to exercise name dispatch.
+FlipAuth is an account-directory launcher for the official Claude Code and Codex CLIs
+on Windows WSL. It never handles token contents. The official client owns login,
+refresh and requests. There is no gateway, quota API, automatic rotation or daemon service.
+Runtime dependencies are Bash and Python 3.11+. No build or package installation is needed.
+Keep the checkout together when installing a symlink.
 
 ## Architecture
 
-**Name-based service dispatch.** The same script handles both services. `$0`'s basename
-selects the service: `claude-switch` → claude, `codex-switch` → codex, and bare `flipauth`
-takes the service as its first argument. This happens once at the top of the file and sets
-`SERVICE`, after which the two services differ only by data, not by code path.
+- `flipauth`: thin Bash entry, preserving invocation aliases.
+- `lib/cli.py`: public dispatch and explicit retirement of snapshot commands.
+- `lib/directory_accounts.py`: registry, home ownership, reviewed config, templates,
+  binding and launch-plan construction.
+- `lib/official_cli.py`: stable official executable discovery and `LaunchPlan`.
+- `lib/process_state.py`: same-user `/proc` facts and exact managed-daemon ownership.
+- `lib/short_commands.py`: current selection, status and detached switch admission.
+- `lib/session_switch.py`: receipted Herdr shutdown/restart orchestration.
 
-**Index-aligned arrays describe the managed files.** Per service, `ACTIVE[]` (live file
-paths), `SUFFIX[]` (saved-profile filename suffix), and `REQUIRED[]` ("yes"/"no") are filled
-in parallel. Claude has one required file (`.credentials.json`); Codex has two — a required
-`auth.json` and an optional `.credentials.json`. Every operation (`save`, `activate`,
-`validate`, `doctor`) loops over these array indices, so adding or changing a managed file
-means editing the array declarations, not the command logic. `ACTIVE[0]` is treated as the
-primary file (e.g. profile listing globs on `SUFFIX[0]`).
+`LaunchPlan(service, account, home, executable, argv, env)` is the shared launch
+contract for explicit run, login, current selection and switching. It preserves
+cwd, PID, terminal, stdio, native arguments, signals and exit status through exec.
+Validate a resolved executable for the WSL boundary, but execute/persist its stable
+entry spelling. Never pin wrappers to a release-number path. Set `HERDR_AGENT` only
+on the launched child, not globally. A binary's install directory is not its account.
 
-**State layout.** Saved profiles live under `$STATE_DIR` (default `~/.<svc>/oauth-accounts/`)
-as `<profile>.<suffix>`. A `.active-profile` marker file records which profile is live.
-Directories are mode `700`, files mode `600`.
+`accounts.json` schema 1 stores canonical homes, configuration provenance, optional
+stable executable entries, current selection and the separately recorded initial
+default. It contains no credentials. Existing schema-1 registrations remain valid.
+Use the registry writer lock for read/modify/write; writes are atomic and private.
 
-**Atomic, validated swaps.** `atomic_copy` writes to a `mktemp` temp file then `mv -f` into
-place (never a partial write). Credentials are validated *before* save and *before* load:
-Claude requires a top-level JSON object with a `claudeAiOauth` object and allows additional
-Claude-managed OAuth blocks such as `designOauth`; Codex accepts any JSON object.
-`cmd_activate` auto-saves the currently-live credentials back into the outgoing profile
-before loading the new one, so an in-progress token refresh is never silently lost.
+Named homes cannot overlap across services/accounts or the registry. Creation must
+explicitly choose `--bare` or a reviewed `--template`. Copy only reviewed rules and
+settings: credentials, sessions, plugin runtime, writable databases and caches must
+never be shared. Refuse symlinked/hardlinked runtime/config files. No automatic
+cross-project configuration reuse is authorized.
 
-**Quota is the only networked command.** `flipauth claude quota [profile]`
-sends each saved profile's OAuth access token to Anthropic's undocumented
-`GET /api/oauth/usage` endpoint (base overridable via `CLAUDE_SWITCH_API_BASE`) and
-prints 5-hour / 7-day rolling-window utilization plus reset countdowns. It requires
-headers `anthropic-beta: oauth-2025-04-20` and `User-Agent: claude-code/<version>`
-(omitting the User-Agent triggers persistent 429s; the version is read from the
-installed `claude` CLI with a hardcoded fallback). Every other command is offline.
-The active profile uses the live credential file (freshest token); others use their
-saved snapshot and degrade to `token expired — re-activate` on 401. Codex has its own
-path (below) rather than an HTTP endpoint. Keep quota opt-in and non-fatal for both —
-it must never make `status`/`save`/`activate` depend on the network.
+Authentication is local Claude subscription login or Codex file storage. Reject known
+auth/provider/remote/storage overrides at CLI/environment/config boundaries without
+printing their values. The launcher is not the official project's/system's complete
+policy evaluator, an OS sandbox or a guarantee of provider identity. Claude Console
+OAuth without an API key uses state outside the config home and is unsupported.
 
-**The quota cache separates observation from authorisation.** Every successful usage
-response is merged into `$STATE_DIR/.quota-cache.json` (schema `1`, mode `600`, atomic
-`mkstemp` + `os.replace`), and `cmd_status` replays it with zero network calls. Four
-invariants are load-bearing and all four have tests:
+## Selection, observation and switching
 
-1. *Allow-list, not filter.* `sample_of` builds the entry field by field — `fetched_at`,
-   `source`, and each window's `utilization`/`resets_at`. Never copy the raw response
-   through; a token must not be able to reach the cache by being added upstream.
-2. *Merge, never replace.* A single-profile query updates only that profile's entry, and
-   `write_cache` is a no-op when nothing succeeded, so a 401/429/offline run preserves
-   the last good sample instead of erasing it.
-3. *A cached percentage is a lower bound, printed as `≥N%`.* Windows have fixed reset
-   times, so usage can only have grown since the sample. This is enough to rule an
-   account out and never enough to authorise starting one — only a live `quota` call can
-   do that. Do not "improve" this into a bare `N%`.
-4. *An expired window is `unknown`, not a stale number.* If `resets_at` has passed (or
-   is missing/unparseable), the window degrades to `unknown` / `—`. Showing the old
-   percentage would be actively misleading.
+- `account run/login NAME` sets the home and execs the official CLI. It does not change
+  selection or stop peers. Login is not a switch of an already-running process.
+- `account current` reads the launch preference under the startup gate.
+- `cod NAME` / `cc NAME` explicitly cancel and replace all verified same-service local
+  Herdr CLI sessions, including busy ones. No cross-account conversation resume.
+- Bindings use one generator and one official executable resolver. PATH discovery
+  skips FlipAuth wrappers; binding records the stable official entry in the registry.
+  A generated staging file is not deployment on the user's PATH.
+- Status reports selection/default separately from observed PID/home/account facts.
+  File presence and labels are never authenticated identity. No token reads or requests.
 
-Degradation is one-directional: a missing, corrupt, or unknown-schema cache prints a
-single note and leaves the active/saved lines — and `save`/`activate`/`doctor` — intact.
-Codex's `status` never renders this block.
+Read actual argv from NUL-delimited `/proc/<pid>/cmdline`, never `shlex.split(ps args)`.
+Recognize native version-named Claude clients, including older running versions after
+an upgrade. Match the executable, not a spoofable argv0. Codex release directories
+also contain code-mode/sandbox helpers: those are not CLI sessions. Never classify
+an ordinary child from inherited config-root variables or arbitrary argument text.
+Preserve UID, PID birth identity and zombie handling.
 
-**Two writers feed one cache; `observe` is the cheap one.** `quota` pays a network
-request. `observe` reads a Claude Code statusLine payload on stdin — Claude Code already
-hands the same two windows to the configured status-line command on every render — and
-writes the same schema-1 entries with `source: "statusline"`. Consequences worth keeping:
+A detached bounded worker survives its requesting CLI. One operation mutex serializes
+switches and another startup gate prevents launches during shutdown. Preflight all
+process/pane/cwd/config/login-presence ownership before cancelling any session.
+Unmanaged/uninspectable processes refuse the operation before cancellation.
+Cancellation precedes normal `/exit`; read back uncertain delivery without repeating.
+Blocked or unfamiliar UI is never automatically answered. New conversations start in
+original panes/cwds after old processes exit and selection commits.
 
-- The two writers duplicate the merge-and-atomically-write logic in separate Python
-  heredocs. They must stay format-compatible; the test suite asserts a cache written by
-  one is read and merged by the other, which is the guard that actually matters.
-- `observe` runs inside a shell prompt, so it is **silent on every failure** and skips
-  writes while values are unchanged and the sample is under `OBSERVE_MIN_INTERVAL`
-  seconds old. Never make it print, prompt, or exit non-zero on bad input.
-- statusLine reports `resets_at` as a unix epoch and `used_percentage` on the same 0-100
-  scale as the endpoint's `utilization`. `observe` normalises the timestamp to ISO so one
-  cache never holds two time formats.
-- Attribution is by `.active-profile` alone. The payload carries no account identity and
-  Claude credentials carry no account identifier, so there is deliberately **no
-  cross-check** — do not invent one from the credential file hash, which changes on every
-  token refresh and would only produce false alarms.
+Only exact Codex managed-daemon records (boot ID, PID start ticks, home and argv) permit
+SIGTERM, only after TUIs exit, and through pidfd. Never SIGKILL or restore a daemon.
+A new/unknown process blocks continuation. Validate new PID/start/home per target and
+recheck all targets before `complete`. Completion proves observed process homes, not
+identity, request success, readiness or future liveness. A partial restart leaves the
+committed selection and a failure receipt; do not automatically roll back or retry.
 
-**Codex quota goes through the app-server, and three protocol facts make it safe.**
-There is no HTTP usage endpoint; the data is behind the JSON-RPC method
-`account/rateLimits/read` on `codex app-server --stdio`. Each of these is load-bearing:
+## Snapshot retirement
 
-1. *`CODEX_HOME` relocates the config root.* Every profile is read from a throwaway copy
-   of its snapshot (dir `700`, files `600`), and nothing is ever copied back. A query
-   therefore cannot mutate a saved profile or activate an account. Tests assert the temp
-   home is never the real Codex dir or the state dir. That copy is a real credential, so
-   it must not outlive the query, and three separate things are needed to guarantee it:
+Do not reintroduce credential copying, activation markers or direct OAuth quota calls.
+Old `save/activate/login/quota/doctor/legacy` routes refuse before touching state.
+`*-switch` accepts only explicit directory `account` routes. Existing files remain
+untouched. `observe` is a silent no-op for old statusLine callers. Legacy documentation
+and Git history are historical evidence, not runnable design or current test gates.
 
-   - The Python reader runs as a **background job** with a bash `trap` forwarding
-     TERM/INT/HUP to it. Without that the child is merely orphaned when flipauth is
-     killed: it keeps querying, with the credential copy still on disk, after the command
-     the user killed has exited.
-   - The Python signal handler bails **once**. A second signal — and there usually is one,
-     since the shell forwards what it received — would otherwise raise again from inside
-     the `finally` and abort it *before* `rmtree`, stranding exactly the copy the handler
-     exists to remove. This was a real bug; the accompanying test sends two signals.
-   - SIGKILL cannot be caught, so each run first sweeps `.codex-quota-*` directories it
-     owns that are older than five minutes. That floor is what stops the sweep from
-     deleting a concurrent run's live directory — do not lower it without revisiting that.
+## Verification
 
-   Cleanup is not instantaneous: the app-server is terminated before its `CODEX_HOME` is
-   removed. Tests poll for the directory to drain rather than asserting on the same tick.
-2. *`account/chatgptAuthTokens/refresh` is a server→client request.* The app-server does
-   not refresh tokens itself — it asks the connected client to do it and hand the new
-   token back. flipauth **declines** it, so no rotation can happen on this path. A test
-   drives a stub that issues the request and asserts flipauth answers with an error and
-   never with a result. Do not "helpfully" implement that handler.
-3. *Windows are identified by `windowDurationMins`, never by `primary`/`secondary`.*
-   Those names are ordinal, not semantic. The current response reports both a 5-hour
-   window (`300` minutes) and a 7-day window (`10080` minutes), and their positions may
-   change again. Keying on the field name would silently mislabel the data. This is also
-   why the Codex cache holds a `windows` **list** keyed by duration rather than the two
-   fixed keys the Claude cache uses — the two services keep separate cache files (they
-   already live in separate state dirs) precisely so Claude's shape is not forced onto
-   Codex.
+```sh
+bash tests/run-all.sh
+python3 tests/directory-accounts-test.py
+python3 tests/launcher-contract-test.py
+python3 tests/observation-test.py
+python3 tests/process-state-test.py
+python3 tests/short-commands-test.py
+python3 tests/magpie-cleanup-test.py
+bash -n ./flipauth
+```
 
-`usedPercent` is on a 0-100 scale — verified empirically, not inferred from the name:
-`100.0` appears in recorded session history. `rateLimitResetCredits` from the same
-response is surfaced too; its expiry is rendered in **local** time because it is a
-deadline the operator acts on, while the cache stores UTC.
+Tests use private disposable HOME/registry/homes, fake CLIs/Herdr and controlled process
+indexes. Never let a test discover, signal or log into a real user CLI. Preserve meaningful
+checks for terminal/PID/argument behavior, concurrent ownership, native version naming,
+PATH wrappers and upgrades, zombie exits/PID reuse, managed-daemon records, uncertain
+admission and refusal of legacy mutations. No provider request is needed for any suite.
 
-**`status --json` must agree with the text form.** It is a second rendering of the same
-cache, so the lower-bound and expired-window semantics are carried in the field names:
-`utilization_at_least` (never `utilization`) and `state` ∈ `known`/`expired`/`missing`.
-Both services carry `quota`, but the inner shape differs because the services genuinely
-differ: Claude has two named windows, Codex a variable-length `windows` list. Each service
-has a test asserting its text and JSON renderings agree on every profile; those tests are
-the reason the duplicated window logic is safe to keep.
+Offline tests do not prove real identity or a deployed entrypoint. Real login, credential
+migration, peer shutdown, PATH deployment and publishing need appropriate user authority.
+Never commit credentials, private labels or local account notes. Use ignored
+`README.local.md`, `*.local.md`, or `docs/local/` for private operator notes.
 
-**Doctor inspects without leaking.** `doctor` is a Python heredoc per service. It reports
-file modes, sizes, and `sha16` hashes — never raw tokens. For Codex it decodes the JWT
-*payload* (not the signature) to derive an `identity_fp`/`sub_fp` fingerprint and the access
-token's expiry, and can compare the WSL identity against the Windows-side `auth.json`. For
-Claude the access token is opaque (not a JWT), so doctor deliberately does **not** claim any
-identity/email — the test suite asserts this. When touching doctor output, preserve the
-no-token-leak and no-false-identity guarantees; both are covered by tests.
+## Work records
 
-## Conventions
+Short work is recorded by code, verification and Git. For expensive multi-session work,
+reuse one `work/<id>/card.md` with acceptance, boundaries, resume point and closure.
+Do not create another todo/journal. Read KANBAN before changing it; update for actual
+scope/decision/recovery changes. Reusable prevention goes in `lessons.md` as
+**When** / **Do** / **Evidence**, at most one per task.
 
-- **Credential shapes are load-bearing.** The Claude validator must require a valid
-  `claudeAiOauth` object but preserve extra top-level OAuth blocks that the official CLI
-  writes. If Anthropic changes the on-disk format again, this validator and the doctor
-  parsing must change together.
-- **The golden rule is a real correctness constraint, not advice:** a live `claude`/`codex`
-  process holds tokens in memory and can write a stale token back over a freshly-activated
-  profile. User-facing messages reinforce "start a fresh process"; keep that intent.
-- **This repo is published open source.** Never commit credential files or local account
-  notes. `.gitignore` already excludes the credential/runtime artifact classes plus
-  `README.local.md` / `*.local.md` / `docs/local/`; keep private operator notes there.
-- All behavior is configurable via the `CLAUDE_SWITCH_*` / `CODEX_SWITCH_*` environment
-  variables (documented in README.md) — tests rely on this for sandboxing.
+## Shared assets
+
+| Asset | Path | Allowed use | How to find |
+|---|---|---|---|
+| None declared | — | No automatic cross-project rules, skills or config reuse | Ask the owning project before adding shared assets |

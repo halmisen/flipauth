@@ -21,3 +21,16 @@ docs/private/
 # a public repo. A shared `.claude/settings.json` may still be committed.
 .claude/worktrees/
 .claude/settings.local.json
+
+# Local directory-account registry and disposable offline test homes.
+accounts.json
+.accounts.lock
+.accounts-*
+work/offline-tests.*/
+work/flipauth-accounts-*/
+work/flipauth-launch-contract-*/
+work/flipauth-process-*/
+__pycache__/
+switches/
+.switch-*
+.*-switch.lock

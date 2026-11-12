@@ -1,65 +1,48 @@
 # KANBAN — 当前项目状态
 
-> 本文件是唯一的短状态面板。短任务以代码、验证和 Git 历史为记录；需要精确跨会话恢复时才创建 `work/<id>/card.md`。
+> 唯一短状态面板。长任务恢复入口：[card.md](work/directory-launcher/card.md)。
 
-## 当前方向
+## 当前方向与授权
 
-用户 2026-10-13 确定本次范围：个人终端凭据切换，取消 Claude 和 Codex remote-control 开机启动，由 Harness 禁用对应登录任务并保持配置默认禁用，不增加 daemon 自动恢复或远程服务编排。个人会话建议使用 `codex --no-daemon`；保留旧进程退出后再换凭据的保护。
+2026-11-12 用户授权从第一性原理重构 FlipAuth，并由 Codex 负责实现。
+账号目录固定，官方 CLI 独占登录、刷新与请求；同服务两个账号各用独立可写状态。
+不使用网关、凭据复制、配额轮询、自动轮换或开机服务。
+保留此前确定的切换语义：明确 `cod/cc NAME` 时中断同服务全部旧 CLI，再原 pane/cwd 重启。
+普通启动不停止其他账号；初始默认、后续启动选择、实际进程事实分别展示。
 
-Herdr 联系规则归 Harness 全局指令：工具 shell 缺少 `HERDR_ENV` 不再单独阻断用户要求的联系；按明确会话、实时项目路径、代理类型和就绪状态核对目标，使用显式 pane ID，不凭 UI 焦点或无可靠调用者上下文的 `--current` 判断身份。此规则不放宽 flipauth 的凭据写入进程闸门。
+本次仅改 FlipAuth 代码、文档和离线验证。没有真实登录、凭据迁移、停止现有会话、
+部署 PATH 入口、修改其他项目、提交推送或发布。既有真实登记表和账号目录不迁移、不改写。
 
-研究并支持 OMP（oh-my-pi）凭据切换。OMP OAuth 位于独立的 `~/.omp/agent/agent.db`，当前切换 `~/.claude/` 或 `~/.codex/` 不会影响 OMP；目标是让一次 `flipauth` 操作一致切换官方 CLI 与 OMP，但不能引入 API 中转站。
+## 当前实现
 
-## 已验证
+- 所有启动入口共用 `LaunchPlan`，官方程序通过稳定入口调用，包装不固定版本文件。
+- PATH 发现跳过 FlipAuth 包装；绑定将官方稳定入口记录在登记表，直接命令也能复用。
+- 新进程设置限定于自身的 `HERDR_AGENT`，原生版本号程序不再丢失 Herdr 类型提示。
+- `process_state` 从 `/proc` 读取真实 argv、执行文件、home、UID 和启动标识；
+  可以识别升级前仍运行的原生 Claude，不从任意参数或继承 home 的普通子进程猜服务类型。
+- detached worker 保留操作锁/启动闸门、停止前预检、不确定投递回读、僵尸退出与 PID 重用保护。
+  managed daemon 校验官方记录、boot ID、启动标识、home、精确子命令；先 updater 后 server，
+  只用 pidfd SIGTERM。完成前再次复核所有目标。
+- `status [--json]` 分开显示选择、初始默认、实际 PID/home、失配和最近回执；
+  worker 消失或回执损坏可见，不改历史回执，也不把文件存在当成身份验证。
+- 旧快照命令和直接 OAuth quota 路径已退役，旧文件保持原样。`observe` 是静默兼容空操作。
+  原快照测试随功能移除，现以拒绝执行/数据未变的契约测试取代。
+- 新增已知认证来源和远端服务器旁路检查；仍不是官方完整策略评估器或操作系统沙箱。
 
-- 2026-09-08：已核实 Windows Codex 与 Claude 桌面版已安装；检查时两个 Windows 进程均未运行。
-- WSL 与 Windows Codex 使用各自的配置根；`doctor` 对 Windows Codex 凭据仅做读取和身份指纹比较，不写回 Windows 文件。
-- 当前 Windows Codex 身份与 WSL 保存的 profile 身份不一致；不能把 Windows 登录状态当作 WSL profile 的切换结果。
-- 工作树中的 Windows 边界保护会在写入或凭据复制前拒绝 Windows 受管路径、CLI 配置根错配、原生 Windows 二进制和 Windows 侧 Codex quota 临时目录；对应测试为 `tests/windows-boundary-test.sh`。
-- 隔离结论有运行条件：保持 CLI 配置根和临时目录在 WSL 文件系统内，并使用 WSL 版 `claude` / `codex`；边界测试通过后才可把保护视为发布保证。
+## 验证与恢复
 
-## 下一步
+最终完整离线入口 7 项、0 失败，共 58 个场景；另有 Bash/Python 语法和差异检查通过。
+覆盖进程退出竞态、daemon 预检出生标识、伪造 argv0、原生辅助程序排除与最终全部目标复核。
+最终设计和日志见 [refactor.md](work/directory-launcher/refactor.md)。
+已通过新版 status 只读观察到原生版本 Claude 和各 Codex CLI/app-server 的独立 home，
+没有改动真实进程、凭据或选择。该结果只证明目录观察，未证明请求身份或切号成功。
 
-用户 2026-10-09 要求开新 session 只读 review 本轮个人 Codex 切换改动。入口：
-[review 交接](docs/local/20261009-personal-codex-switch-review.md)，含 flipauth / Harness 的文件范围、源码指纹、隔离测试与红绿证据、未验收边界。当前未提交；不得操作真实凭据、服务或重启，也不得覆盖 Harness 的其他 WIP。下一 session 的完成标准是独立 review 结论，区分本地实现与真实验收。
+此前用户首次实机切换失败和 zombie 修复保留为历史证据：
+[zombie-fix.md](work/directory-launcher/zombie-fix.md)。旧源码摘要/验证日志不代表当前重构版本。
+Magpie 清理仍是独立手动脚本，默认只预览；本次没有执行真实清理。
 
-2026-10-13 后续决策覆盖旧交接中“保留 Claude 自启动”的范围；复核新增的全局 Herdr 规则和自启动退休配置时，以 Harness [回执](../harness/docs/20261013-remote-control-autostart-retirement.md) 及当前源码为准。下次正常登录或重启后，由用户确认 Claude/Codex remote-control 未从退休入口启动；任务禁用回读不能替代该实机验收，不为验收主动重启。
+## 后续实机验收
 
-在真实但可接受退出的 idle Herdr Claude 或 Codex pane 上，手动运行一次对应的
-`flipauth <service> <profile>`，确认 Claude 的 pane 命令或 Codex 的 agent prompt 让 TUI
-退出后 pane 保留并回到 shell，再确认 profile 切换完成。Codex 多 pane 验收应确认逐个发送
-`/exit`，且所有 TUI 退出后才停止 managed daemon。不要用 `herdr server stop` 作为该验收的替代，
-因为它会停止同一 server 的无关工作。
-
-### 改进候选（来源：2026-10-26 只读审视，未实施，按优先级）
-
-1. 加 `tests/run-all.sh` 自动发现并汇总全部套件：`AGENTS.md:28-35` 漏列 `tests/process-safety-test.sh`，`AGENTS.md:9`/`:34` 的行数与检查数已过期。
-2. 用户确认 10-09 个人 Codex 切换 review 是否完成，再改写上方「下一步」：所述改动已在 `ff61ef3`、`35f9390` 提交，本面板无 review 结论。
-3. 加只读预检 `flipauth <svc> <profile> --dry-run [--json]`，在不发 `/exit`、不写凭据的前提下对真实 Herdr 核对闸门判定：`flipauth:390-471`，假 herdr 结构见 `tests/process-safety-test.sh:20-60`。
-4. Claude 分支在 `pane run /exit` 前补 idle 复查，与 Codex 分支一致（推断风险，先问作者）：`flipauth:418-428` 对比 `flipauth:442`。
-
-## 边界
-
-- 不把真实账号标签、机器路径、用量数字、token 或凭据数据库写入 Git。
-- 激活必须继续原子、先验证并保存退出账号的最新 token；查询配额不得改变活动凭据。
-- 任何凭据写入（save、activate、login）前，必须先确认对应 CLI 的系统进程为零。Herdr 中只有
-  已精确关联且 `idle` 的同服务 pane 可以收到 `/exit`；Codex 必须通过 `herdr agent prompt` 逐个
-  退出 TUI，并在此之后才对精确匹配的 managed `app-server --managed-daemon`
-  及其 `pid-update-loop` 辅助进程（官方 PID 记录、进程启动标识和配置根必须匹配，不依赖父子关系）发送 SIGTERM。不发 SIGKILL。working、blocked、unknown、不可检查和
-  其他 Herdr 外进程一律中止，且 live credential、快照和 `.active-profile` 不得改变。
-- Claude 与 Codex 的进程闸门必须隔离；不得停止 Pi、OMP、普通 shell、无关服务或整个 Herdr server。
-- OMP 支持必须先证明 token 所有权与可移植边界；不以 API relay 绕过订阅和客户端边界。
-- 任何 statusLine 安装只能显式 opt-in，保留并备份既有设置。
-
-## Parked
-
-- OSS statusLine onboarding。
-- Codex full-reset credit 消费；该 RPC 是写操作，保持在 flipauth 范围外。
-- `quota | head` 的既有 SIGPIPE traceback。
-- OMP 后续研究保持原方向；本轮先完成个人 Codex 切换 review，再研究 `auth-broker` / `auth-gateway` 机制及 token 可移植边界。
-- force-stop：不实现通用 SIGTERM/SIGKILL 选项。仅对精确匹配的 Codex managed daemon 发送
-  SIGTERM 并等待；超时即中止，不升级为 SIGKILL。其他状态不确定的进程仍拒绝切换。
-
-## 迁移说明
-
-2026-08-10 起，`tasks/todo.md` 退出控制面；其有效 Next、Deferred 与稳定事实已合并到本文件和 `AGENTS.md`，旧记录由 Git 历史保留。
+离线实现完成后，需要在独立、可退出的原生 CLI 会话验证四个账号目录的登录身份、刷新、
+Herdr 展示与同服务停止/重启；普通命令包装的实际 PATH 部署也单独验收。
+现有活动会话不会因为代码改动自行切换身份或改变 Herdr 展示。

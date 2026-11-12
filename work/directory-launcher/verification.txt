@@ -1,0 +1,260 @@
+
+Running flipauth
+
+Running claude-doctor-test.sh
+ok   - doctor has Claude header
+ok   - doctor reports subscription_type pro
+ok   - doctor lists saved acct
+ok   - doctor reports expires_at
+ok   - doctor does NOT leak token
+ok   - doctor does NOT claim identity_fp
+----
+all claude-doctor checks passed
+
+Running claude-quota-cache-test.sh
+ok   - 200 response creates the quota cache
+ok   - quota cache mode 600
+ok   - state dir still mode 700
+ok   - cache records the queried profile
+ok   - querying beta keeps alpha's cached entry
+ok   - cache marks the active profile's sample as live
+ok   - 401 leaves the previous alpha sample intact
+ok   - 429 leaves the previous alpha sample intact
+ok   - connection failure leaves the cache intact
+ok   - status issues no request to the usage endpoint
+ok   - status keeps the active profile line
+ok   - status keeps the saved profiles line
+ok   - status labels the block as a cached snapshot
+ok   - status marks the data as not live
+ok   - status shows the 5h value as a lower bound
+ok   - status shows the 7d value as a lower bound
+ok   - status shows a reset countdown
+ok   - status shows a fresh sample as just now
+ok   - status marks the active profile
+ok   - status reports the age of an older sample
+ok   - expired 5h window reports unknown
+ok   - expired 5h window hides the stale percentage
+ok   - still-valid 7d window keeps its value
+ok   - status writes nothing to stderr
+ok   - status piped into grep -q does not traceback
+ok   - status piped into grep -q still succeeds
+ok   - corrupt cache still prints the active profile
+ok   - corrupt cache still prints saved profiles
+ok   - corrupt cache explains the missing quota block
+ok   - corrupt cache does not break save
+ok   - corrupt cache does not break activate
+ok   - corrupt cache does not break doctor
+ok   - missing cache still prints saved profiles
+ok   - missing cache hints at the quota command
+ok   - quota output does not leak the alpha token
+ok   - quota output does not leak the beta token
+ok   - status output does not leak the alpha token
+ok   - status output does not leak the beta token
+ok   - cache does not leak the alpha token
+ok   - cache does not leak the beta token
+ok   - cache does not store an Authorization header
+ok   - codex status keeps its two lines
+ok   - codex status does not read the Claude cache
+ok   - codex status does not borrow Claude profile names
+ok   - codex quota is no longer rejected as Claude-only
+ok   - uncached profile still appears in the block
+ok   - observe creates a cache entry for the active profile
+ok   - observe entry is tagged as coming from the status line
+ok   - observed cache is mode 600
+ok   - observe normalises the epoch reset to an ISO string
+ok   - observed utilization keeps the 0-100 scale in status
+ok   - observe does not attribute to the inactive profile
+ok   - observe skips the write while values are unchanged and fresh
+ok   - observe writes immediately when a value moves
+ok   - observe refreshes the sample age once the interval elapses
+ok   - observe survives non-JSON stdin
+ok   - observe survives empty stdin
+ok   - observe survives a payload with no rate_limits
+ok   - observe survives a payload with null windows
+ok   - no bad payload altered the cache
+ok   - observe writes nothing when no profile is active
+ok   - observe output is silent
+ok   - observe never leaks a token
+ok   - codex observe is rejected
+ok   - observe rejects extra arguments
+ok   - observe preserves an entry written by the quota command
+ok   - status renders both sources together
+ok   - --json emits parseable JSON
+ok   - --json reports the active profile
+ok   - --json names the value a lower bound
+ok   - --json reports cache state ok
+ok   - --json makes no request to the stub
+ok   - --json rejects further arguments
+ok   - status rejects unknown options
+ok   - --json marks an expired window rather than reporting a number
+ok   - --json gives an unsampled profile a null quota
+ok   - --json flags a corrupt cache instead of dying
+ok   - codex --json never carries Claude's named windows
+ok   - text and --json agree on every profile
+----
+all claude-quota-cache checks passed
+
+Running codex-quota-test.sh
+ok   - quota prints the 5h window row
+ok   - quota prints the 7d window row
+ok   - quota prints the 5h used percentage
+ok   - quota prints the 7d used percentage
+ok   - quota prints a reset countdown
+ok   - quota marks the active profile
+ok   - quota surfaces the reset credit
+ok   - quota creates the cache
+ok   - cache is mode 600
+ok   - state dir stays mode 700
+ok   - cache records the plan type
+ok   - cache keys both windows by duration, not by field name
+ok   - cache distinguishes live from snapshot
+ok   - no read used the real codex dir
+ok   - no read used the state dir
+ok   - each profile got its own temp home
+ok   - the temp home is mode 700
+ok   - the copied auth is mode 600
+ok   - each profile was read with its own token
+ok   - querying did not mutate the saved snapshot
+ok   - querying did not activate another profile
+ok   - no temp codex home was left behind
+ok   - SIGTERM mid-query removes the temp credential copy
+ok   - SIGINT mid-query removes the temp credential copy
+ok   - SIGHUP mid-query removes the temp credential copy
+ok   - a second signal during cleanup does not strand the copy
+ok   - SIGKILL does strand a temp dir
+ok   - the next run sweeps a stranded temp dir
+ok   - the sweep spares a fresh temp dir from a concurrent run
+ok   - flipauth never answers a token refresh request
+ok   - flipauth declines the refresh request
+ok   - a refresh-then-401 run preserves the cache
+ok   - 401 is reported as an expired token
+ok   - 401 preserves the previous cache
+ok   - a hung app-server times out without erasing the cache
+ok   - a missing codex binary fails clearly
+ok   - status starts no app-server
+ok   - status keeps the active profile line
+ok   - status keeps the saved profiles line
+ok   - status shows the cached value as a lower bound
+ok   - status shows the cached 7d value as a lower bound
+ok   - status labels the 5h window by duration
+ok   - status labels the 7d window by duration
+ok   - status shows the sample age
+ok   - status shows the reset credit
+ok   - an elapsed window reports unknown
+ok   - an elapsed window hides the stale percentage
+ok   - codex --json parses
+ok   - codex --json now carries quota
+ok   - codex --json names the value a lower bound
+ok   - codex --json labels and keys both windows by duration
+ok   - codex --json marks the elapsed window expired
+ok   - codex --json exposes the reset credit
+ok   - codex text and --json agree on every window
+ok   - quota output does not leak the work token
+ok   - quota output does not leak the alt token
+ok   - status output does not leak a token
+ok   - --json does not leak a token
+ok   - cache does not leak the work token
+ok   - cache does not leak the alt token
+ok   - cache stores no access_token field
+ok   - claude --json keeps its named windows
+ok   - claude observe is still accepted
+ok   - codex observe is still rejected
+----
+all codex-quota checks passed
+
+Running parity-test.sh
+ok   - claude save creates profile file
+ok   - claude state dir mode 700
+ok   - claude profile file mode 600
+ok   - claude marker = one
+ok   - claude activate one restores tok-one
+ok   - claude saved two before switching away
+ok   - claude preserves extra oauth blocks
+ok   - claude status lists one two
+ok   - claude save rejects wrong shape
+ok   - codex save creates auth profile
+ok   - codex save creates creds profile
+ok   - codex state dir mode 700
+ok   - codex auth profile mode 600
+ok   - codex creds profile mode 600
+ok   - codex marker = red
+ok   - codex saved blue before switching away
+ok   - codex activate red restores auth a.b.c
+ok   - codex doctor header
+ok   - codex doctor lists saved blue red
+----
+all parity checks passed
+
+Running process-safety-test.sh
+ok   - no Claude process permits a switch
+ok   - no Codex process permits a switch
+ok   - idle Herdr Claude exits through one ordered submission then switches
+ok   - working Herdr Claude refuses without mutation
+ok   - idle Herdr Codex exits through the agent API then switches
+ok   - every idle Codex agent receives /exit separately before switching
+ok   - a Codex pane stuck after /exit aborts before changing credentials
+
+Stopping the Codex managed app-server daemon with SIGTERM.
+ok   - Codex TUI exits before its managed daemon receives SIGTERM
+
+Stopping the Codex managed app-server daemon with SIGTERM.
+ok   - exact Codex managed daemon pair receives SIGTERM before switching
+ok   - official sibling daemon and updater exit before a personal credential switch
+ok   - local daemon without remote-control exits before switching
+ok   - stale official PID identity refuses without signalling or credential mutation
+ok   - daemon from another configuration root refuses without signalling or writing
+ok   - working Herdr Codex refuses without mutation
+ok   - unmanaged Claude refuses without mutation
+ok   - unmanaged Codex refuses without mutation
+ok   - an unexited idle Claude times out without mutation
+ok   - Claude switch leaves Codex and Pi process records untouched
+ok   - Codex switch ignores Claude process records
+----
+all process-safety checks passed
+
+Running windows-boundary-test.sh
+ok   - a managed dir on a Windows filesystem is refused
+ok   - the refusal names the WSL-only scope
+ok   - save is refused before it can write
+ok   - the refused save wrote no profile
+ok   - activate is refused before it can write
+ok   - the refused activate left the marker alone
+ok   - a live credential file on a Windows filesystem is refused
+ok   - without a usable findmnt a /mnt path still refuses
+ok   - the fallback refusal created nothing under /mnt
+ok   - a mismatched CODEX_HOME refuses the switch
+ok   - the mismatch says the change would not reach the CLI
+ok   - the refused mismatch wrote no profile
+ok   - a matching CODEX_HOME is accepted
+ok   - a Windows codex executable is refused
+ok   - a codex binary on a Windows filesystem is refused
+ok   - a TMPDIR on a Windows filesystem is refused
+ok   - the refused quota copied no credential
+ok   - a WSL-local setup is unaffected
+----
+all windows-boundary checks passed
+
+Running directory-accounts-test.py
+test_alias_dispatch_and_literal_prompt_after_separator (__main__.Accounts.test_alias_dispatch_and_literal_prompt_after_separator) ... ok
+test_bind_idempotence_conflicts_recursion_and_quoting (__main__.Accounts.test_bind_idempotence_conflicts_recursion_and_quoting) ... ok
+test_concurrent_add_keeps_both_entries (__main__.Accounts.test_concurrent_add_keeps_both_entries) ... ok
+test_conflicting_environment_settings_and_cli_arguments (__main__.Accounts.test_conflicting_environment_settings_and_cli_arguments) ... ok
+test_default_homes_symlink_retarget_and_missing_directory (__main__.Accounts.test_default_homes_symlink_retarget_and_missing_directory) ... ok
+test_existing_registration_is_idempotent_and_preserves_every_byte (__main__.Accounts.test_existing_registration_is_idempotent_and_preserves_every_byte) ... ok
+test_explicit_config_and_presence_never_claim_identity (__main__.Accounts.test_explicit_config_and_presence_never_claim_identity) ... ok
+test_home_override_and_all_arguments_stdio_working_directory (__main__.Accounts.test_home_override_and_all_arguments_stdio_working_directory) ... ok
+test_independent_accounts_and_official_login (__main__.Accounts.test_independent_accounts_and_official_login) ... ok
+test_interrupt_signals_pid_and_other_process_untouched (__main__.Accounts.test_interrupt_signals_pid_and_other_process_untouched) ... ok
+test_invalid_config_and_symlinked_configuration_do_not_leak (__main__.Accounts.test_invalid_config_and_symlinked_configuration_do_not_leak) ... ok
+test_readonly_list_does_not_create_state_or_launch_cli (__main__.Accounts.test_readonly_list_does_not_create_state_or_launch_cli) ... ok
+test_secret_and_provider_templates_are_refused_without_echoing_values (__main__.Accounts.test_secret_and_provider_templates_are_refused_without_echoing_values) ... ok
+test_templates_are_copies_and_exclude_runtime_state (__main__.Accounts.test_templates_are_copies_and_exclude_runtime_state) ... ok
+test_terminal_is_not_replaced_with_pipes (__main__.Accounts.test_terminal_is_not_replaced_with_pipes) ... ok
+test_windows_paths_binaries_symlinks_and_corrupt_registry (__main__.Accounts.test_windows_paths_binaries_symlinks_and_corrupt_registry) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 4.841s
+
+OK
+
+Suites/checks: 8; failed: 0
