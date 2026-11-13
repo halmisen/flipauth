@@ -19,8 +19,8 @@ Keep the checkout together when installing a symlink.
   binding and launch-plan construction.
 - `lib/official_cli.py`: stable official executable discovery and `LaunchPlan`.
 - `lib/process_state.py`: same-user `/proc` facts and exact managed-daemon ownership.
-- `lib/short_commands.py`: current selection, status and detached switch admission.
-- `lib/session_switch.py`: receipted Herdr shutdown/restart orchestration.
+- `lib/short_commands.py`: current selection, status and terminal switch admission.
+- `lib/session_switch.py`: receipted CLI and managed-daemon shutdown.
 
 `LaunchPlan(service, account, home, executable, argv, env)` is the shared launch
 contract for explicit run, login, current selection and switching. It preserves
@@ -51,11 +51,21 @@ OAuth without an API key uses state outside the config home and is unsupported.
 - `account run/login NAME` sets the home and execs the official CLI. It does not change
   selection or stop peers. Login is not a switch of an already-running process.
 - `account current` reads the launch preference under the startup gate.
-- `cod NAME` / `cc NAME` explicitly cancel and replace all verified same-service local
-  Herdr CLI sessions, including busy ones. No cross-account conversation resume.
+- `cod NAME` / `cc NAME` (and named launchers such as `codex-primary`) switch only when
+  a same-service CLI or daemon of another home is running: then they stop every
+  verified same-service CLI, including busy ones, and every daemon, before starting
+  one fresh CLI in the requesting terminal and cwd. When only the target home (or
+  nothing) runs, they start one more CLI and stop nothing. Pass-through subcommands
+  and flags (`exec`, `login`, `mcp`, `--version`, Claude `-p`, ...; first argument
+  only for subcommands) run in the named home without switching or selecting.
+  A switch needs a TTY; invoking a switch from inside a CLI is refused.
+  Plain `codex` stays the official entry and is not a switch.
+  No cross-account conversation resume or relaunch in old panes.
 - Bindings use one generator and one official executable resolver. PATH discovery
   skips FlipAuth wrappers; binding records the stable official entry in the registry.
   A generated staging file is not deployment on the user's PATH.
+- `account bind NAME PATH --switch` creates a named switch launcher;
+  without `--switch`, it creates an ordinary parallel launcher.
 - Status reports selection/default separately from observed PID/home/account facts.
   File presence and labels are never authenticated identity. No token reads or requests.
 
@@ -66,20 +76,31 @@ also contain code-mode/sandbox helpers: those are not CLI sessions. Never classi
 an ordinary child from inherited config-root variables or arbitrary argument text.
 Preserve UID, PID birth identity and zombie handling.
 
-A detached bounded worker survives its requesting CLI. One operation mutex serializes
-switches and another startup gate prevents launches during shutdown. Preflight all
-process/pane/cwd/config/login-presence ownership before cancelling any session.
-Unmanaged/uninspectable processes refuse the operation before cancellation.
-Cancellation precedes normal `/exit`; read back uncertain delivery without repeating.
-Blocked or unfamiliar UI is never automatically answered. New conversations start in
-original panes/cwds after old processes exit and selection commits.
+One operation mutex serializes switches and a startup gate prevents managed launches
+during shutdown; both remain held until exec. Preflight all process births, registered
+homes, config, caller ancestry and target login-file presence before sending a signal.
+Uninspectable processes, unregistered homes or unmanaged background servers refuse
+before termination. No detached switch worker or old-pane relaunch is used.
 
-Only exact Codex managed-daemon records (boot ID, PID start ticks, home and argv) permit
-SIGTERM, only after TUIs exit, and through pidfd. Never SIGKILL or restore a daemon.
-A new/unknown process blocks continuation. Validate new PID/start/home per target and
-recheck all targets before `complete`. Completion proves observed process homes, not
-identity, request success, readiness or future liveness. A partial restart leaves the
-committed selection and a failure receipt; do not automatically roll back or retry.
+Codex restores its terminal (raw mode, alternate screen, focus/paste/mouse reporting)
+only when it quits from its own keyboard input; every external signal leaves those
+modes enabled in the old terminal. Close Codex CLIs only by Ctrl+C sent through
+Herdr's `agent send-keys` (rejected once the agent no longer holds the pane), re-checking
+PID birth after each pane-foreground query and right before each key,
+until the PID is gone and the pane foreground no longer holds it. A Codex CLI not in
+exactly one Herdr pane refuses during preflight. Never signal a Codex CLI, never write
+another process's PTY directly, and send no key other than Ctrl+C (its effect on an
+approval overlay is unobserved). A headless Codex outside any pane also refuses.
+Claude restores its terminal on SIGTERM: terminate exact Claude CLI births through
+pidfd SIGTERM, then wait for exit. Recheck this per-service split after a major CLI
+upgrade with `work/directory-launcher/native-terminal-probe.py`. Stop verified
+Codex daemon updaters before servers, using boot ID, PID start ticks, home and argv
+from official PID records. Never SIGKILL. If anything remains or a new process appears,
+stop with a failure receipt. Never explicitly start/restore a daemon or force
+`--no-daemon`: the newly exec'd official client owns automatic daemon startup.
+`exec-admitted` records the launch handoff; status separately checks whether that
+PID/start/home is actually observed. Neither establishes provider identity or request
+success. Do not automatically roll back or retry a partially completed shutdown.
 
 ## Snapshot retirement
 
@@ -102,11 +123,11 @@ python3 tests/magpie-cleanup-test.py
 bash -n ./flipauth
 ```
 
-Tests use private disposable HOME/registry/homes, fake CLIs/Herdr and controlled process
+Tests use private disposable HOME/registry/homes, fake CLIs and controlled process
 indexes. Never let a test discover, signal or log into a real user CLI. Preserve meaningful
 checks for terminal/PID/argument behavior, concurrent ownership, native version naming,
-PATH wrappers and upgrades, zombie exits/PID reuse, managed-daemon records, uncertain
-admission and refusal of legacy mutations. No provider request is needed for any suite.
+PATH wrappers and upgrades, zombie exits/PID reuse, managed-daemon records, single
+terminal admission and refusal of legacy mutations. No provider request is needed for any suite.
 
 Offline tests do not prove real identity or a deployed entrypoint. Real login, credential
 migration, peer shutdown, PATH deployment and publishing need appropriate user authority.

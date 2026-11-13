@@ -4,45 +4,35 @@
 
 ## 当前方向与授权
 
-2026-11-12 用户授权从第一性原理重构 FlipAuth，并由 Codex 负责实现。
-账号目录固定，官方 CLI 独占登录、刷新与请求；同服务两个账号各用独立可写状态。
-不使用网关、凭据复制、配额轮询、自动轮换或开机服务。
-保留此前确定的切换语义：明确 `cod/cc NAME` 时中断同服务全部旧 CLI，再原 pane/cwd 重启。
-普通启动不停止其他账号；初始默认、后续启动选择、实际进程事实分别展示。
+2026-11-13 用户修正切换语义：带账号名的切换入口关闭同服务全部旧 CLI，
+再停止旧 Codex daemon，只在输入命令的新终端及其工作目录启动一个新会话。
+2026-11-13 再修正：只在有其他账号的 CLI/daemon 时才清场；同账号或无进程时直接再开一个，
+不停 daemon；`exec`/`login`/`--version` 等非交互子命令直通不切换。用户日常只用命名切换入口（如 `codex-<name>`），
+普通 `codex` 保持官方入口。旧终端回到 shell。新 daemon 由官方 CLI 自动拉起，不显式启动。
+用户已授权代码、部署脚本及命名入口部署；本轮不实际停止会话、登录或迁移凭据。
+账号目录固定，官方 CLI 独占登录、刷新和请求；无网关、配额轮询或自动轮换。
+2026-11-13 用户定界：额度只做 L0 显示（Claude statusLine 的 `rate_limits`、Codex 内置 `status_line`），
+不做提醒、预选、自动切换、凭据读取或额度请求；切换只由用户在协作间隙手动执行。
+默认记录、后续选择、实际进程与服务端身份分别核验；普通官方入口不随选择变化。
 
-本次仅改 FlipAuth 代码、文档和离线验证。没有真实登录、凭据迁移、停止现有会话、
-部署 PATH 入口、修改其他项目、提交推送或发布。既有真实登记表和账号目录不迁移、不改写。
+## 当前实现与恢复
 
-## 当前实现
+- 所有账号启动共用 `LaunchPlan`；命名包装使用稳定官方入口，拒绝覆盖既有不同文件。
+- `scripts/deploy-launchers.sh <service> [--check]` 部署所有已登记账号的命名切换入口；
+  普通服务命令不被替换，部署不触发实际切换或改变选择。
+- 切换需要独立 TTY，拒绝从待关闭 CLI 的工具子进程触发；先预检所有已知进程归属，
+  Codex CLI 必须在 Herdr pane 内，经 `herdr agent send-keys` 发 Ctrl+C 正常退出（否则预检拒绝）；
+  Claude CLI 用 pidfd SIGTERM（原生已验证会恢复终端）；等待退出后，最后按 updater → server 停止有官方 PID 记录的 daemon。
+- 无 detached worker 或旧 pane 重开；不强制 `--no-daemon`，不显式启动新 daemon。
+  进程重用、未知归属、停不掉或启动前出现新进程时留下失败回执，不强杀、不自动重试。
+- `exec-admitted` 只记录交接，`status` 独立回读 PID/start/home；不证明请求身份或成功。
+- 当前设计及验证入口：[terminal-switch.md](work/directory-launcher/terminal-switch.md)。
+  旧目录重构与原 pane 方案保留为历史：[refactor.md](work/directory-launcher/refactor.md)。
 
-- 所有启动入口共用 `LaunchPlan`，官方程序通过稳定入口调用，包装不固定版本文件。
-- PATH 发现跳过 FlipAuth 包装；绑定将官方稳定入口记录在登记表，直接命令也能复用。
-- 新进程设置限定于自身的 `HERDR_AGENT`，原生版本号程序不再丢失 Herdr 类型提示。
-- `process_state` 从 `/proc` 读取真实 argv、执行文件、home、UID 和启动标识；
-  可以识别升级前仍运行的原生 Claude，不从任意参数或继承 home 的普通子进程猜服务类型。
-- detached worker 保留操作锁/启动闸门、停止前预检、不确定投递回读、僵尸退出与 PID 重用保护。
-  managed daemon 校验官方记录、boot ID、启动标识、home、精确子命令；先 updater 后 server，
-  只用 pidfd SIGTERM。完成前再次复核所有目标。
-- `status [--json]` 分开显示选择、初始默认、实际 PID/home、失配和最近回执；
-  worker 消失或回执损坏可见，不改历史回执，也不把文件存在当成身份验证。
-- 旧快照命令和直接 OAuth quota 路径已退役，旧文件保持原样。`observe` 是静默兼容空操作。
-  原快照测试随功能移除，现以拒绝执行/数据未变的契约测试取代。
-- 新增已知认证来源和远端服务器旁路检查；仍不是官方完整策略评估器或操作系统沙箱。
+## 实机验收
 
-## 验证与恢复
-
-最终完整离线入口 7 项、0 失败，共 58 个场景；另有 Bash/Python 语法和差异检查通过。
-覆盖进程退出竞态、daemon 预检出生标识、伪造 argv0、原生辅助程序排除与最终全部目标复核。
-最终设计和日志见 [refactor.md](work/directory-launcher/refactor.md)。
-已通过新版 status 只读观察到原生版本 Claude 和各 Codex CLI/app-server 的独立 home，
-没有改动真实进程、凭据或选择。该结果只证明目录观察，未证明请求身份或切号成功。
-
-此前用户首次实机切换失败和 zombie 修复保留为历史证据：
-[zombie-fix.md](work/directory-launcher/zombie-fix.md)。旧源码摘要/验证日志不代表当前重构版本。
-Magpie 清理仍是独立手动脚本，默认只预览；本次没有执行真实清理。
-
-## 后续实机验收
-
-离线实现完成后，需要在独立、可退出的原生 CLI 会话验证四个账号目录的登录身份、刷新、
-Herdr 展示与同服务停止/重启；普通命令包装的实际 PATH 部署也单独验收。
-现有活动会话不会因为代码改动自行切换身份或改变 Herdr 展示。
+2026-11-13 用户实机试切后报告旧终端残留界面并刷控制序列，随后已切回原账号。
+根因：Codex 0.167.2 对任何外部信号都不恢复终端，只有键盘内退出会恢复；Claude 收 SIGTERM 会恢复。
+2026-11-13 Claude 已在源码改为 Codex 经 Herdr Ctrl+C 退出，终端状态回归先红后绿，
+一次性 Herdr pane 内未登录 Codex 实测通过（`terminal-switch.md`）；
+真实已登录会话切换（旧终端可输入、鼠标不出字、新终端单一目标账号、daemon 自动出现）仍待用户现场执行。

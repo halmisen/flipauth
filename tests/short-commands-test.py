@@ -4,6 +4,11 @@
 import importlib.util
 import json
 import os
+import pty
+import re
+import select
+import termios
+import threading
 from pathlib import Path
 import signal
 import subprocess
@@ -38,12 +43,46 @@ def alive(pid):
 CLI = r'''#!/usr/bin/env python3
 import json, os, signal, sys, time
 from pathlib import Path
-from fixture_helpers import state
+from fixture_helpers import state, alive
 service = Path(sys.argv[0]).name.split('-')[0]
 directory = Path(os.environ['CODEX_HOME' if service == 'codex' else 'CLAUDE_CONFIG_DIR'])
 args = sys.argv[1:]
+if args[:3] == ['app-server', 'daemon', 'start']:
+    sys.exit('forbidden: FlipAuth must let the interactive CLI auto-start its daemon')
+if args[:1] == ['app-server']:
+    role='updater' if args[1:3] == ['daemon','pid-update-loop'] else 'server'
+    with state() as data:
+        data.setdefault('daemons',{})[str(os.getpid())]={'home':str(directory),'role':role}
+        data['events'].append(['daemon-started',role,str(directory),os.getpid()])
+    def stop_daemon(sig,frame):
+        with state() as data: data['events'].append(['daemon-stopped',role,str(directory),os.getpid()])
+        sys.exit(0)
+    signal.signal(signal.SIGTERM,stop_daemon)
+    (directory/('daemon-ready-'+str(os.getpid()))).touch()
+    while True: time.sleep(.02)
+if service == 'codex' and args[:1] != ['login'] and '--no-daemon' not in args:
+    with state() as data:
+        exists=any(row['home']==str(directory) and row['role']=='server' and alive(int(pid))
+                   for pid,row in data.get('daemons',{}).items())
+    if not exists:
+        import subprocess
+        daemon_dir = directory / 'app-server-daemon'
+        daemon_dir.mkdir(exist_ok=True)
+        for filename, command in [('daemon.pid', ['app-server', '--managed-daemon', '--listen', 'unix://']),
+                                  ('daemon-updater.pid', ['app-server', 'daemon', 'pid-update-loop'])]:
+            child = subprocess.Popen([sys.argv[0], *command], env=os.environ,
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+            ticks = int(Path('/proc/'+str(child.pid)+'/stat').read_text().rsplit(')',1)[1].split()[19])
+            (daemon_dir / filename).write_text(json.dumps({'pid':child.pid, 'processIdentity':{
+                'startTicks':ticks, 'bootId':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}}))
+            deadline=time.monotonic()+3
+            while not (directory/('daemon-ready-'+str(child.pid))).exists():
+                if child.poll() is not None or time.monotonic()>deadline: sys.exit(40)
+                time.sleep(.01)
 record = {'home':str(directory),'args':args,'pid':os.getpid(),'cwd':os.getcwd()}
 (directory/'called.json').write_text(json.dumps(record))
+with state() as data: data['events'].append(['invoked',str(directory),os.getpid(),os.getcwd()])
 if args[:1] == ['login'] or args[:2] == ['auth','login']:
     (directory/('auth.json' if service == 'codex' else '.credentials.json')).write_text('{}')
     sys.exit(0)
@@ -55,20 +94,42 @@ with state() as data:
     data['panes'][pane]['home'] = str(directory)
     data['panes'][pane]['status'] = 'working'
     data['events'].append(['started',pane,str(directory)])
-def cancel(sig,frame):
-    with state() as data:
-        data['events'].append(['cancel',pane])
-        if not data.get('stubborn'): data['panes'][pane]['status'] = 'idle'
-def end(sig,frame):
-    with state() as data: data['events'].append(['exited',pane])
+# Like the native TUIs: raw mode plus alternate screen, mouse, focus and paste reporting.
+import select, termios, tty
+MODES = b'\x1b[?1049h\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h'
+saved = termios.tcgetattr(0)
+tty.setraw(0)
+os.write(1, MODES)
+def restore():
+    os.write(1, MODES.replace(b'h', b'l'))
+    termios.tcsetattr(0, termios.TCSAFLUSH, saved)
+def finish(how):
+    restore()
+    with state() as data: data['events'].append(['exited',pane,how])
     sys.exit(0)
-signal.signal(signal.SIGINT,cancel)
-signal.signal(signal.SIGTERM,end)
+if service == 'claude':
+    # Native Claude restores its terminal on SIGTERM; native Codex installs no handler.
+    signal.signal(signal.SIGTERM, lambda sig, frame: finish('sigterm'))
+def keys():
+    if not select.select([0],[],[],.02)[0]: return
+    for byte in os.read(0, 64):
+        if byte != 3: continue
+        with state() as data:
+            row = data['panes'][pane]
+            data['events'].append(['ctrl+c',pane,row['status']])
+            if data.get('stubborn') or row.get('stubborn'): continue
+            if row['status'] == 'working':
+                row['status'] = 'idle'; continue
+        finish('ctrl+c')
 (directory/('ready-'+pane)).touch()
 if os.environ.get('FX_SWITCH_ON_START') and directory.name == '.codex':
     import subprocess
-    subprocess.run([os.environ['FX_FLIPAUTH'],'cod','secondary'],capture_output=True)
-while True: time.sleep(.02)
+    import pty
+    master,slave=pty.openpty()
+    result=subprocess.run([os.environ['FX_FLIPAUTH'],'cod','secondary'],stdin=slave,capture_output=True,text=True)
+    os.close(master); os.close(slave)
+    (directory/'nested-result').write_text(json.dumps({'rc':result.returncode,'error':result.stderr}))
+while True: keys()
 '''
 
 PS = r'''#!/usr/bin/env python3
@@ -84,54 +145,44 @@ with state() as data:
             if '-eo' in sys.argv: prefix += 'pts/9 '
             prefix += row['service']+' '
             print(prefix+row['service']+' --fixture')
+    for pid in data.get('daemons',{}):
+        if alive(int(pid)): print(pid+' 1 codex daemon')
 '''
 
+
+
+
 HERDR = r'''#!/usr/bin/env python3
-import json, os, signal, subprocess, sys
+import json, sys
 from fixture_helpers import state, alive
-args=sys.argv[1:]
-if args[:2] == ['--session','fixture']:
-    args=args[2:]
-elif args[:1] == ['--session']: sys.exit(2)
-def output(data): print(json.dumps(data))
-if args == ['session','list','--json']:
-    output({'sessions':[{'name':'fixture','running':True}]})
-elif args == ['api','snapshot']:
-    with state() as data:
-        agents=[{'agent':row['service'],'pane_id':pane,'cwd':row['cwd'],
-                 'agent_status':row['status']} for pane,row in data['panes'].items() if row.get('managed',True)]
-    output({'result':{'snapshot':{'agents':agents}}})
-elif args[:2] == ['pane','process-info']:
-    pane=args[args.index('--pane')+1]
-    with state() as data:
-        row=data['panes'][pane]; pid=row.get('pid')
-        procs=[{'pid':pid,'name':row['service'],'cwd':row['cwd']}]
-        if not pid or not alive(pid):
-            if pid and data.get('include_zombies') and not row.get('reported_dead'):
-                row['reported_dead']=True
-                data['events'].append(['zombie-observed',pane])
-            else:
-                procs=[{'pid':7,'name':'bash'}]
-    output({'result':{'process_info':{'foreground_processes':procs,'shell_pid':7}}})
-elif args[:2] == ['agent','send-keys']:
-    assert args[3:] == ['ctrl+c']
-    with state() as data: pid=data['panes'][args[2]]['pid']
-    os.kill(pid,signal.SIGINT); output({'result':{'delivered':True}})
-elif args[:2] == ['agent','prompt']:
-    assert args[3:] == ['/exit']
-    with state() as data: pid=data['panes'][args[2]]['pid']
-    os.kill(pid,signal.SIGTERM); output({'result':{'delivered':True}})
-elif args[:2] == ['pane','run']:
-    pane=args[2]
-    with state() as data:
-        data['events'].append(['run',pane]); uncertain=data.get('uncertain_admission',False)
-    env=os.environ.copy(); env['FX_PANE']=pane
-    subprocess.Popen(['/bin/sh','-c',args[3]],env=env,stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
-    if uncertain: sys.exit(1)
-    output({'result':{'admitted':True}})
-else: sys.exit(2)
+args = sys.argv[1:]
+if args[:1] == ['--session']:
+    if args[1] != 'fx': sys.exit(3)
+    args = args[2:]
+with state() as data:
+    panes = {name: row for name, row in data['panes'].items() if row.get('managed')}
+    if args == ['session', 'list', '--json']:
+        print(json.dumps({'sessions': [{'name': 'fx', 'running': True}]}))
+    elif args == ['api', 'snapshot']:
+        print(json.dumps({'result': {'snapshot': {'panes': [{'pane_id': p} for p in panes]}}}))
+    elif args[:3] == ['pane', 'process-info', '--pane'] and args[3] in panes:
+        row = panes[args[3]]
+        live = row.get('pid') and alive(row['pid'])
+        rows = [{'pid': row['pid'], 'name': row['service']}] if live else [{'pid': 1, 'name': 'bash'}]
+        print(json.dumps({'result': {'process_info': {'pane_id': args[3], 'shell_pid': 1,
+                                                       'foreground_processes': rows}}}))
+    elif args[:2] == ['agent', 'send-keys'] and args[2] in panes:
+        row = panes[args[2]]
+        # Like Herdr: agent input is rejected once the agent no longer controls the pane.
+        if not (row.get('pid') and alive(row['pid'])): sys.exit(4)
+        row.setdefault('keys', []).extend(args[3:])
+        data['events'].append(['send-keys', args[2], *args[3:]])
+    else:
+        sys.exit(2)
 '''
+
+KEYS = {'ctrl+c': b'\x03'}
+MODE = re.compile(rb'\x1b\[\?([0-9]+)([hl])')
 
 
 class ShortCommands(unittest.TestCase):
@@ -151,14 +202,73 @@ class ShortCommands(unittest.TestCase):
         for filename, text in [('ps',PS),('herdr',HERDR),('codex-official',CLI),('claude-official',CLI)]:
             path=self.bin/filename; path.write_text(text); path.chmod(0o700)
         self.addCleanup(self.cleanup_processes)
+        # A tiny terminal host: owns each pane's PTY master like Herdr does.
+        self.masters, self.output, self.running = {}, {}, True
+        self.pump = threading.Thread(target=self.pump_terminals, daemon=True)
+        self.pump.start()
+        self.addCleanup(self.stop_pump)
+
+    def stop_pump(self):
+        self.running = False
+        self.pump.join(timeout=3)
+        for master in self.masters.values(): os.close(master)
+
+    def locked_state(self):
+        import contextlib, fcntl
+        @contextlib.contextmanager
+        def locked():
+            with self.statefile.with_suffix('.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                text = self.statefile.read_text()
+                data = json.loads(text)
+                yield data
+                if json.dumps(data) != json.dumps(json.loads(text)):
+                    self.statefile.write_text(json.dumps(data))
+        return locked()
+
+    def pump_terminals(self):
+        while self.running:
+            for pane, master in list(self.masters.items()):
+                while select.select([master], [], [], 0)[0]:
+                    try: data = os.read(master, 65536)
+                    except OSError: break
+                    if not data: break
+                    self.output[pane] += data
+                with self.locked_state() as data:
+                    queued = data['panes'][pane].pop('keys', [])
+                for key in queued:
+                    try: os.write(master, KEYS[key])
+                    except OSError: pass
+            time.sleep(.01)
+
+    def terminal(self, pane):
+        """Return (modes ever enabled, modes still enabled, cooked+echo restored)."""
+        time.sleep(.1)
+        states, seen = {}, set()
+        for mode, value in MODE.findall(bytes(self.output[pane])):
+            states[mode.decode()] = value == b'h'
+            if value == b'h': seen.add(mode.decode())
+        flags = termios.tcgetattr(self.masters[pane])[3]
+        return seen, {m for m, on in states.items() if on}, bool(flags & termios.ICANON and flags & termios.ECHO)
+
+    def assert_terminal_restored(self, pane):
+        seen, left, cooked = self.terminal(pane)
+        # Positive control: the fixture really enabled the modes it must clear.
+        self.assertTrue({'1049', '1003', '1006', '2004', '1004'} <= seen, seen)
+        self.assertEqual(left, set(), 'terminal modes left enabled in old pane '+pane)
+        self.assertTrue(cooked, 'old pane left in raw mode without echo')
 
     def state(self, **values):
         # Tests only update metadata before submitting workers, never during mutation.
-        data=json.loads(self.statefile.read_text()); data.update(values)
-        self.statefile.write_text(json.dumps(data)); return data
+        with self.locked_state() as data:
+            data.update(values)
+        return data
 
     def cleanup_processes(self):
         data=json.loads(self.statefile.read_text())
+        for pid in data.get('daemons', {}):
+            try: os.kill(int(pid),signal.SIGTERM)
+            except ProcessLookupError: pass
         for row in data['panes'].values():
             pid=row.get('pid')
             if pid:
@@ -169,7 +279,7 @@ class ShortCommands(unittest.TestCase):
             except subprocess.TimeoutExpired: process.kill(); process.wait()
         deadline=time.monotonic()+3
         while time.monotonic()<deadline:
-            live=False
+            live=any(lifecycle.identity(int(pid)) is not None for pid in data.get('daemons',{}))
             for row in data['panes'].values():
                 try:
                     fields=Path('/proc/'+str(row.get('pid'))+'/stat').read_text().rsplit(')',1)[1].split()
@@ -178,9 +288,17 @@ class ShortCommands(unittest.TestCase):
             if not live: break
             time.sleep(.02)
 
-    def short(self, service, *args, ok=True, **kwargs):
-        result=subprocess.run([str(self.program),service,*map(str,args)], env=self.env,
-                              capture_output=True,text=True,timeout=8,**kwargs)
+    def short(self, service, *args, ok=True, terminal=True, **kwargs):
+        values=list(map(str,args))
+        is_switch = values and values[0] not in {'status','list','new','--help'} and values[1:2] != ['login']
+        if is_switch and '--once' not in values: values += ['--','--once']
+        master,slave=pty.openpty()
+        try:
+            result=subprocess.run([str(self.program),service,*values], env=self.env,
+                                  stdin=slave if terminal else subprocess.DEVNULL,
+                                  capture_output=True,text=True,timeout=12,**kwargs)
+        finally:
+            os.close(master); os.close(slave)
         self.assertEqual(result.returncode,0,result.stderr) if ok else self.assertNotEqual(result.returncode,0)
         self.assertNotIn('Traceback',result.stderr)
         return result
@@ -194,27 +312,24 @@ class ShortCommands(unittest.TestCase):
         return first,second
 
     def start(self, pane, service, directory, managed=True, extra_env=None):
-        data=self.state(); cwd=self.root/('project '+pane); cwd.mkdir()
-        data['panes'][pane]={'service':service,'cwd':str(cwd),'status':'working','managed':managed}
-        self.state(**data)
+        cwd=self.root/('project '+pane); cwd.mkdir()
+        with self.locked_state() as data:
+            data['panes'][pane]={'service':service,'cwd':str(cwd),'status':'working','managed':managed}
         env={**self.env,'FX_PANE':pane, 'CODEX_HOME' if service=='codex' else 'CLAUDE_CONFIG_DIR':str(directory)}
         env.update(extra_env or {})
+        master,slave=pty.openpty()
         process=subprocess.Popen([self.env['FLIPAUTH_'+service.upper()+'_BIN']],env=env,cwd=cwd,
-                                 stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                                 stdin=slave,stdout=slave,stderr=subprocess.DEVNULL,start_new_session=True)
+        os.close(slave)
+        self.output[pane]=bytearray(); self.masters[pane]=master
         self.originals=getattr(self,'originals',[])+[process]
         self.wait_file(directory/('ready-'+pane),process)
         return process
 
     def receipt(self, service='codex'):
-        deadline=time.monotonic()+12
-        while time.monotonic()<deadline:
-            paths=list((self.root/'registry/switches').glob(service+'-*.json'))
-            if paths:
-                path=max(paths,key=lambda p:p.stat().st_mtime)
-                data=json.loads(path.read_text())
-                if data['state'] in {'complete','failed','already-selected'}: return data
-            time.sleep(.05)
-        self.fail('switch worker did not finish')
+        paths=list((self.root/'registry/switches').glob(service+'-*.json'))
+        self.assertTrue(paths)
+        return json.loads(max(paths,key=lambda p:p.stat().st_mtime_ns).read_text())
 
     def test_login_creates_home_once_and_imports_no_snapshots(self):
         self.short('cod','secondary','login','--','--device-auth')
@@ -259,189 +374,277 @@ class ShortCommands(unittest.TestCase):
             self.assertEqual(result.returncode,0,result.stderr)
             record=json.loads(result.stdout)
             self.assertEqual(record['home'],str(directory))
-            self.assertEqual(record['args'],['--no-daemon','--once','a b',"'",'$HOME'])
+            self.assertEqual(record['args'],['--once','a b',"'",'$HOME'])
         self.assertFalse((self.home/'tripwire').exists())
 
-    def test_busy_all_panes_stop_before_any_restart_and_other_service_survives(self):
+    def test_busy_clis_and_daemon_stop_before_one_new_cli_and_other_service_survives(self):
         first,second=self.setup_accounts()
         claude=self.create('claude','other')
         a=self.start('a','codex',first); b=self.start('b','codex',first)
         other=self.start('c','claude',claude)
-        self.short('cod','secondary')
+        cwd=self.root/'new terminal cwd'; cwd.mkdir()
+        result=self.short('cod','secondary',cwd=cwd)
         receipt=self.receipt()
-        self.assertEqual(receipt['state'],'complete',receipt)
+        self.assertEqual(receipt['state'],'exec-admitted',receipt)
         self.assertEqual(a.wait(timeout=3),0); self.assertEqual(b.wait(timeout=3),0)
         self.assertIsNone(other.poll())
-        events=json.loads(self.statefile.read_text())['events']
-        first_run=next(i for i,e in enumerate(events) if e[0]=='run')
-        self.assertTrue(all(next(i for i,e in enumerate(events) if e==['exited',pane])<first_run for pane in ('a','b')))
-        for target in receipt['panes']:
-            self.assertEqual(target['state'],'home-verified')
-            self.assertTrue(Path('/proc/'+str(target['new_pid'])).exists())
-        self.assertEqual(self.record(second)['args'], ['--no-daemon'])
-        self.assertEqual(self.short('cod','status').returncode,0)
+        for pane in ('a','b'): self.assert_terminal_restored(pane)
+        self.assertEqual({row['exit'] for row in receipt['stopped_cli']},{'ctrl+c'})
+        self.assertEqual({row['pid'] for row in receipt['stopped_cli']},{a.pid,b.pid})
+        record=self.record(second)
+        self.assertEqual(record['pid'],receipt['pid'])
+        self.assertEqual(record['cwd'],str(cwd))
+        self.assertEqual(record['args'],['--once'])
+        events=self.state()['events']
+        new_index=next(i for i,e in enumerate(events) if e[:2]==['invoked',str(second)])
+        old_stops=[i for i,e in enumerate(events) if e[0] in {'exited','daemon-stopped'}]
+        self.assertTrue(old_stops and max(old_stops)<new_index)
+        roles=[e[1] for e in events if e[0]=='daemon-stopped']
+        self.assertEqual(roles,['updater','server'])
+        self.assertFalse(any(e[0]=='run' for e in events))
+        self.assertEqual(len([e for e in events if e[:2]==['invoked',str(second)]]),1)
         self.assertIn('selected: secondary',self.short('cod','status').stdout)
-        # Repeated selection does not close/restart already-correct sessions.
-        before=[e for e in events if e[0]=='run']
-        self.short('cod','secondary')
-        self.assertEqual(self.receipt()['state'],'already-selected')
-        after=json.loads(self.statefile.read_text())['events']
-        self.assertEqual(before,[e for e in after if e[0]=='run'])
 
-    def test_claude_busy_switch_and_uncertain_admission_readback(self):
-        first,second=self.setup_accounts('claude')
-        self.start('a','claude',first)
-        self.state(uncertain_admission=True)
-        self.short('cc','secondary')
-        receipt=self.receipt('claude')
-        self.assertEqual(receipt['state'],'complete',receipt)
-        events=json.loads(self.statefile.read_text())['events']
-        self.assertEqual(len([e for e in events if e[0]=='run']),1)
+    def test_named_launcher_for_the_running_account_joins_without_stopping_anything(self):
+        first, _ = self.setup_accounts()
+        original = self.start('a', 'codex', first)
+        launcher = self.bin / 'codex-primary'
+        self.call('codex', 'bind', 'primary', launcher, '--switch')
+        master,slave=pty.openpty()
+        try:
+            result=subprocess.run([str(launcher),'--once'],env=self.env,stdin=slave,
+                                  capture_output=True,text=True,timeout=12)
+        finally:
+            os.close(master); os.close(slave)
+        self.assertEqual(result.returncode,0,result.stderr)
+        receipt=self.receipt()
+        self.assertEqual((receipt['state'],receipt['mode']),('exec-admitted','same-account'),receipt)
+        self.assertIsNone(original.poll())
+        self.assertNotEqual(self.record(first)['pid'],original.pid)
+        events=self.state()['events']
+        self.assertFalse(any(e[0] in {'send-keys','exited','daemon-stopped'} for e in events))
+        self.assertEqual(self.record(first)['args'],['--once'])
 
-    def test_exited_unreaped_cli_restarts_for_both_services(self):
-        self.state(include_zombies=True)
-        for service, alias in [('codex','cod'),('claude','cc')]:
-            with self.subTest(service=service):
-                first, second = self.setup_accounts(service)
-                process = self.start(service,service,first)
-                self.short(alias,'secondary')
-                record = self.receipt(service)
-                # Do not poll/wait/reap the original until after worker completion.
-                fields=Path('/proc/'+str(process.pid)+'/stat').read_text().rsplit(')',1)[1].split()
-                self.assertEqual(fields[0],'Z')
-                self.assertEqual(record['state'],'complete',record)
-                events=json.loads(self.statefile.read_text())['events']
-                self.assertIn(['zombie-observed',service],events)
-                self.assertEqual(len([e for e in events if e==['run',service]]),1)
-                self.assertEqual(self.record(second)['home'],str(second))
-                self.assertEqual(process.wait(timeout=3),0)
-
-    def test_exit_between_process_scan_and_identity_check(self):
-        first, second = self.setup_accounts()
-        process = self.start('race','codex',first)
-        start = lifecycle.identity(process.pid)
-        target = {'session':'fixture','pane':'race','pid':process.pid,'start':start}
-        herdr = lifecycle.Herdr()
-        info = {'foreground_processes':[{'pid':process.pid}]}
-        with mock.patch.object(herdr,'foreground',return_value=info), mock.patch.object(
-                lifecycle,'processes',return_value={process.pid:{}}):
-            # A live PID with a different birth identity must still block the action.
-            with self.assertRaises(accounts.Refused):
-                herdr.still_original({**target,'start':start+1},'codex')
-            os.kill(process.pid,signal.SIGTERM)
-            deadline=time.monotonic()+3
-            while time.monotonic()<deadline:
-                fields=Path('/proc/'+str(process.pid)+'/stat').read_text().rsplit(')',1)[1].split()
-                if fields[0]=='Z': break
-                time.sleep(.01)
-            self.assertEqual(fields[0],'Z')
-            # ps saw a live process, but it exited before the next /proc read.
-            self.assertFalse(herdr.still_original(target,'codex'))
-            process.wait(timeout=3)
-            # Reaped between the same two observations is also an ordinary exit.
-            self.assertFalse(herdr.still_original(target,'codex'))
-
-    def test_unmanaged_process_aborts_before_touching_managed_pane(self):
+    def test_account_change_closes_every_pane_in_parallel_and_all_daemons(self):
         first,second=self.setup_accounts()
-        a=self.start('a','codex',first)
-        b=self.start('b','codex',first,managed=False)
-        self.short('cod','secondary')
-        record=self.receipt()
-        self.assertEqual(record['state'],'failed')
-        self.assertIn('unmanaged',record['error'])
+        panes=[self.start(name,'codex',first) for name in ('a','b','c')]
+        target_pane=self.start('d','codex',second)
+        started=time.monotonic()
+        self.short('cod','primary')
+        elapsed=time.monotonic()-started
+        for process in [*panes, target_pane]: self.assertEqual(process.wait(timeout=3),0)
+        for name in 'abcd': self.assert_terminal_restored(name)
+        receipt=self.receipt()
+        self.assertEqual(receipt['mode'],'account-change')
+        self.assertEqual(len(receipt['stopped_cli']),4)
+        # Parallel: every pane gets its first Ctrl+C before any pane has quit.
+        events=self.state()['events']
+        first_exit=next(i for i,e in enumerate(events) if e[0]=='exited')
+        keyed={e[1] for e in events[:first_exit] if e[0]=='send-keys'}
+        self.assertEqual(keyed,set('abcd'))
+        self.assertLess(elapsed,6)
+        self.assertEqual(len([e for e in self.state()['events'] if e[0]=='daemon-stopped']),4)
+
+    def test_non_interactive_subcommands_never_switch(self):
+        first,second=self.setup_accounts()
+        old=self.start('a','codex',first)
+        for extra in (['exec','--once'],['--version'],['mcp','list','--once']):
+            result=self.short('cod','secondary','--',*extra,terminal=False)
+            self.assertEqual(json.loads(result.stdout)['home'],str(second))
+        self.assertIsNone(old.poll())
+        events=self.state()['events']
+        self.assertFalse(any(e[0] in {'send-keys','exited','daemon-stopped'} for e in events))
+        self.assertIn('selected: primary',self.short('cod','status').stdout)
+
+    def test_claude_closes_old_sessions_and_execs_only_in_the_requesting_terminal(self):
+        first,second=self.setup_accounts('claude')
+        old=self.start('a','claude',first)
+        self.short('cc','secondary')
+        self.assertEqual(old.wait(timeout=3),0)
+        self.assert_terminal_restored('a')
+        self.assertEqual(self.receipt('claude')['state'],'exec-admitted')
+        self.assertEqual(self.record(second)['home'],str(second))
+        self.assertFalse(any(e[0].startswith('daemon-') for e in self.state()['events']))
+
+    def test_zombie_cli_is_already_stopped_for_both_services(self):
+        self.state(include_zombies=True)
+        for service,alias in [('codex','cod'),('claude','cc')]:
+            first,second=self.setup_accounts(service)
+            old=self.start(service,service,first)
+            self.short(alias,'secondary')
+            fields=Path('/proc/'+str(old.pid)+'/stat').read_text().rsplit(')',1)[1].split()
+            self.assertEqual(fields[0],'Z')
+            self.assertEqual(self.receipt(service)['state'],'exec-admitted')
+            self.assertEqual(self.record(second)['home'],str(second))
+            self.assertEqual(old.wait(timeout=3),0)
+
+    def test_codex_outside_herdr_is_refused_before_any_cli_or_daemon_stops(self):
+        first,_=self.setup_accounts()
+        a=self.start('a','codex',first); b=self.start('b','codex',first,managed=False)
+        result=self.short('cod','secondary',ok=False)
+        self.assertIn('outside Herdr',result.stderr)
+        self.assertEqual(self.receipt()['state'],'failed')
         self.assertIsNone(a.poll()); self.assertIsNone(b.poll())
-        self.assertFalse(any(e[0]=='cancel' for e in json.loads(self.statefile.read_text())['events']))
+        events=self.state()['events']
+        self.assertFalse(any(e[0] in {'exited','send-keys','daemon-stopped'} for e in events))
+
+    def test_old_codex_pane_gets_its_terminal_back(self):
+        first,second=self.setup_accounts()
+        old=self.start('a','codex',first)
+        self.short('cod','secondary')
+        old.wait(timeout=3)
+        self.assert_terminal_restored('a')
+        self.assertEqual(old.returncode,0)
+        events=self.state()['events']
+        self.assertIn(['exited','a','ctrl+c'],events)
+        self.assertEqual(self.record(second)['home'],str(second))
+
+    def test_failed_stop_receipt_records_each_actual_outcome(self):
+        first,second=self.setup_accounts()
+        quits=self.start('a','codex',first); stuck=self.start('b','codex',first)
+        with self.locked_state() as data: data['panes']['b']['stubborn']=True
+        self.short('cod','secondary',ok=False)
+        self.assertEqual(quits.wait(timeout=3),0); self.assertIsNone(stuck.poll())
+        receipt=self.receipt()
+        self.assertEqual(receipt['state'],'failed')
+        states={row['pid']:row['state'] for row in receipt['stopped_cli']}
+        self.assertEqual(states,{quits.pid:'exited',stuck.pid:'running'})
+        self.assertEqual({row['state'] for row in receipt['stopped_daemon']},{'running'})
+
+    def test_key_is_not_sent_when_the_cli_exits_during_the_foreground_query(self):
+        client={'pid':202,'start':5,'session':'fx','pane':'p','state':'planned'}
+        births=iter([5,5,None])
+        with mock.patch.object(lifecycle,'identity',side_effect=lambda pid: next(births,None)), \
+                mock.patch.object(lifecycle.Herdr,'foreground',
+                                  side_effect=lambda *a, seen=iter([{202}]): next(seen,set())), \
+                mock.patch.object(lifecycle.Herdr,'send_ctrl_c') as sent:
+            lifecycle.exit_in_band([client],1)
+        sent.assert_not_called()
+        self.assertEqual(client['state'],'exited')
+
+    def test_flags_after_the_official_separator_are_prompt_text(self):
+        import short_commands
+        for service,values in [('codex',['--','--help']),('claude',['--','-p']),('codex',['--','exec'])]:
+            self.assertFalse(short_commands.passes_through(service,values),values)
+        for service,values in [('codex',['exec','--','x']),('codex',['--version']),('claude',['-p','hi'])]:
+            self.assertTrue(short_commands.passes_through(service,values),values)
+
+    def test_unregistered_cli_aborts_before_touching_other_clients(self):
+        first,_=self.setup_accounts()
+        a=self.start('a','codex',first)
+        foreign=self.home/'unregistered'; foreign.mkdir(mode=0o700)
+        b=self.start('b','codex',foreign)
+        # No record can authorize terminating the foreign-home managed daemon.
+        self.short('cod','secondary',ok=False)
+        self.assertEqual(self.receipt()['state'],'failed')
+        self.assertIsNone(a.poll()); self.assertIsNone(b.poll())
+        self.assertFalse(any(e[0]=='exited' for e in self.state()['events']))
 
     def test_failed_stop_preserves_selection_and_starts_nothing(self):
         first,second=self.setup_accounts()
-        a=self.start('a','codex',first)
+        old=self.start('a','codex',first)
         self.state(stubborn=True)
-        self.short('cod','secondary')
-        receipt=self.receipt()
-        self.assertEqual(receipt['state'],'failed')
-        self.assertIsNone(a.poll())
+        result=self.short('cod','secondary',ok=False)
+        self.assertIn('did not quit',result.stderr)
+        self.assertEqual(self.receipt()['state'],'failed')
+        self.assertIsNone(old.poll())
         self.assertIn('selected: primary',self.short('cod','status').stdout)
-        self.assertFalse(any(e[0]=='run' for e in json.loads(self.statefile.read_text())['events']))
+        self.assertFalse((second/'called.json').exists())
 
     def test_missing_target_login_fails_before_stopping_and_wrapper_conflicts(self):
         first,second=self.setup_accounts()
-        a=self.start('a','codex',first)
+        old=self.start('a','codex',first)
         (second/'auth.json').unlink()
         self.short('cod','secondary',ok=False)
-        self.assertIsNone(a.poll())
+        self.assertIsNone(old.poll())
         existing=self.root/'codex'; existing.write_text('mine')
         self.call('codex','bind-current',existing,ok=False)
         self.assertEqual(existing.read_text(),'mine')
 
-    def test_worker_survives_the_cli_that_requested_its_own_switch(self):
-        first,second=self.setup_accounts()
-        caller=self.start('caller','codex',first,extra_env={
+    def test_switch_from_inside_a_cli_is_rejected_before_termination(self):
+        first,_=self.setup_accounts()
+        old=self.start('caller','codex',first,extra_env={
             'FX_SWITCH_ON_START':'1','FX_FLIPAUTH':str(self.program)})
-        receipt=self.receipt()
-        self.assertEqual(receipt['state'],'complete',receipt)
-        self.assertEqual(caller.wait(timeout=3),0)
-        self.assertEqual(receipt['panes'][0]['pid'],caller.pid)
-        self.assertNotEqual(receipt['worker_pid'],caller.pid)
+        self.wait_file(first/'nested-result',old)
+        result=json.loads((first/'nested-result').read_text())
+        self.assertNotEqual(result['rc'],0)
+        self.assertIn('separate terminal',result['error'])
+        self.assertIsNone(old.poll())
+        self.assertFalse(any(e[0]=='exited' for e in self.state()['events']))
 
-    def test_same_target_queued_twice_does_not_restart_twice(self):
+    def test_non_terminal_switch_is_rejected_before_termination(self):
+        first,_=self.setup_accounts()
+        old=self.start('a','codex',first)
+        result=self.short('cod','secondary',terminal=False,ok=False)
+        self.assertIn('requires a terminal',result.stderr)
+        self.assertIsNone(old.poll())
+
+    def test_repeated_same_account_commands_keep_the_daemon(self):
+        first,_=self.setup_accounts()
+        self.short('cod','primary')
+        self.short('cod','primary')
+        events=self.state()['events']
+        self.assertEqual(len([e for e in events if e[:2]==['invoked',str(first)]]),2)
+        self.assertFalse(any(e[0]=='daemon-stopped' for e in events))
+        starts=[e for e in events if e[0]=='daemon-started' and e[1]=='server']
+        self.assertEqual(len(starts),1)
+
+    def test_switch_back_stops_the_other_accounts_daemon(self):
         first,second=self.setup_accounts()
-        self.start('a','codex',first)
         self.short('cod','secondary')
-        self.short('cod','secondary')
-        deadline=time.monotonic()+12
-        while time.monotonic()<deadline:
-            paths=list((self.root/'registry/switches').glob('codex-*.json'))
-            records=[json.loads(p.read_text()) for p in paths]
-            if len(records)==2 and all(r['state'] in {'complete','already-selected','failed'} for r in records): break
-            time.sleep(.05)
-        self.assertEqual(sorted(r['state'] for r in records),['already-selected','complete'])
-        self.assertEqual(len([e for e in json.loads(self.statefile.read_text())['events'] if e[0]=='run']),1)
+        self.short('cod','primary')
+        events=self.state()['events']
+        stopped=[e for e in events if e[0]=='daemon-stopped']
+        self.assertEqual([(e[1],e[2]) for e in stopped],[('updater',str(second)),('server',str(second))])
+        self.assertEqual(self.receipt()['mode'],'account-change')
 
-    def test_daemon_pid_reuse_after_preflight_never_opens_a_signal_handle(self):
-        first, second = self.setup_accounts()
-        jobs = self.root / 'registry/switches'
-        jobs.mkdir()
-        receipt = jobs / 'codex-reused.json'
-        receipt.write_text(json.dumps({'target': 'secondary', 'arguments': [], 'state': 'queued'}))
-        daemon = {'pid': 202, 'start': 5, 'home': str(first), 'argv': ['codex', 'app-server'],
-                  'command': ['app-server', '--managed-daemon']}
-        target = {'session': 'fixture', 'pane': 'a', 'pid': 101, 'start': 3,
-                  'cwd': str(self.root), 'state': 'planned'}
-        herdr = mock.Mock()
-        herdr.plan.return_value = ([target], {101})
-        with mock.patch.object(lifecycle, 'Herdr', return_value=herdr), \
-                mock.patch.object(lifecycle, 'processes', side_effect=[
-                    {101: {'pid': 101, 'start': 3}, 202: daemon},
-                    {202: {**daemon, 'start': 99}}]), \
-                mock.patch.object(lifecycle, 'verified_daemons', return_value={202}), \
-                mock.patch.object(lifecycle, 'process_environment', return_value={}), \
-                mock.patch.object(lifecycle, 'identity', return_value=99), \
-                mock.patch.object(lifecycle.os, 'pidfd_open') as opened, \
-                mock.patch.object(lifecycle.signal, 'pidfd_send_signal') as signaled:
-            lifecycle.run_worker('codex', self.program, self.root / 'registry', receipt)
-        result = json.loads(receipt.read_text())
-        self.assertEqual(result['state'], 'failed')
-        self.assertIn('changed since preflight', result['error'])
-        opened.assert_not_called()
+    def test_reused_pid_is_never_signaled(self):
+        with mock.patch.object(lifecycle,'identity',return_value=99), \
+                mock.patch.object(lifecycle.os,'pidfd_open') as opened, \
+                mock.patch.object(lifecycle.signal,'pidfd_send_signal') as signaled:
+            with self.assertRaises(accounts.Refused): lifecycle.terminate(202,5,.1)
+        opened.assert_not_called(); signaled.assert_not_called()
+
+    def test_pid_change_after_handle_open_is_not_signaled(self):
+        with mock.patch.object(lifecycle,'identity',side_effect=[5,99]), \
+                mock.patch.object(lifecycle.os,'pidfd_open',return_value=123), \
+                mock.patch.object(lifecycle.os,'close'), \
+                mock.patch.object(lifecycle.signal,'pidfd_send_signal') as signaled:
+            with self.assertRaises(accounts.Refused): lifecycle.terminate(202,5,.1)
         signaled.assert_not_called()
-        self.assertEqual(json.loads((self.root / 'registry/accounts.json').read_text())['selected']['codex'], 'primary')
 
-    def test_final_sweep_rejects_extra_process_changed_birth_or_changed_pane(self):
-        _, second = self.setup_accounts()
-        target = {'session': 'fixture', 'pane': 'a', 'new_pid': 333, 'new_start': 9}
-        fact = {'start': 9, 'home': str(second)}
-        herdr = mock.Mock()
-        herdr.foreground.return_value = {'foreground_processes': [{'pid': 333}]}
-        with mock.patch.object(lifecycle, 'processes', return_value={333: fact}):
-            lifecycle.verify_restarted_targets(herdr, [target], 'codex', second)
-        for observed in ({333: fact, 444: fact}, {333: {**fact, 'start': 10}}):
-            with self.subTest(observed=observed), mock.patch.object(lifecycle, 'processes', return_value=observed):
-                with self.assertRaises(accounts.Refused):
-                    lifecycle.verify_restarted_targets(herdr, [target], 'codex', second)
-        herdr.foreground.return_value = {'foreground_processes': [{'pid': 444}]}
-        with mock.patch.object(lifecycle, 'processes', return_value={333: fact}):
+    def test_unexpected_process_prevents_daemon_shutdown(self):
+        with mock.patch.object(lifecycle,'processes',return_value={202:{'start':5}}), \
+                mock.patch.object(lifecycle,'verified_daemons',return_value=set()), \
+                mock.patch.object(lifecycle.os,'pidfd_open') as opened:
             with self.assertRaises(accounts.Refused):
-                lifecycle.verify_restarted_targets(herdr, [target], 'codex', second)
+                lifecycle.stop_managed_daemons('codex',self.root/'registry',{},.1)
+        opened.assert_not_called()
+
+    def test_simultaneous_switches_either_launch_or_report_a_process_race(self):
+        first,_=self.setup_accounts()
+        commands=[]
+        terminals=[]
+        try:
+            for _ in range(2):
+                master,slave=pty.openpty(); terminals += [master,slave]
+                commands.append(subprocess.Popen([str(self.program),'cod','primary','--','--once'],
+                    env=self.env,stdin=slave,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True))
+            admitted=0
+            for command in commands:
+                _,error=command.communicate(timeout=12)
+                if command.returncode == 0:
+                    admitted += 1
+                else:
+                    self.assertIn('flipauth:',error)
+                    self.assertTrue(any(word in error for word in ('appeared','unexpected','changed','remain')),error)
+        finally:
+            for fd in terminals: os.close(fd)
+            for command in commands:
+                if command.poll() is None: command.kill(); command.wait()
+        events=self.state()['events']
+        self.assertGreaterEqual(admitted,1)
+        self.assertEqual(len([e for e in events if e[:2]==['invoked',str(first)]]),admitted)
 
 
 if __name__=='__main__': unittest.main(verbosity=2)

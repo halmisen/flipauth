@@ -1,267 +1,260 @@
-"""One-shot, receipted Herdr shutdown/restart. Never migrates credentials."""
+"""Replace same-service CLIs, stop the old daemon, then return to the caller's terminal.
 
-import contextlib
+Only the official CLI owns authentication. No background switch worker, pane
+relaunch, conversation resume, credential copy or SIGKILL is involved.
+
+Codex restores its terminal (raw mode, alternate screen, focus/paste/mouse
+reporting) only when it quits from its own keyboard input; every external signal
+kills it with those modes still enabled in the old terminal. Codex CLIs are
+therefore closed with Ctrl+C delivered through Herdr's supported key API, and a
+Codex CLI outside a Herdr pane is refused before anything is stopped. Claude
+restores its terminal on SIGTERM, so Claude CLIs keep the pidfd path.
+"""
+
 import json
 import os
 from pathlib import Path
-import shlex
 import signal
 import subprocess
 import time
 
 import directory_accounts as accounts
+from process_state import (ancestor_pids, daemon_stop_order, identity,
+                           processes, verified_daemons)
 
-from process_state import (home_of, identity, process_environment, processes,
-                           daemon_stop_order, verified_daemons)
+
+def terminate(pid, start, timeout):
+    """Signal exactly the admitted process birth, then wait for its exit."""
+    current = identity(pid)
+    if current is None:
+        return
+    if current != start:
+        accounts.refuse("process PID changed since preflight; no signal sent")
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        current = identity(pid)
+        if current is None:
+            return
+        if current != start:
+            accounts.refuse("process PID reused; no signal sent")
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    finally:
+        os.close(fd)
+    deadline = time.monotonic() + timeout
+    while identity(pid) == start and time.monotonic() < deadline:
+        time.sleep(.05)
+    if identity(pid) is not None:
+        accounts.refuse("process did not exit; no new CLI started")
+
+
+# Services whose interactive CLI must quit in-band to restore its terminal.
+IN_BAND_EXIT = {"codex"}
+KEY_INTERVAL = .5
 
 
 class Herdr:
+    """Herdr CLI access. Only pane lookup and supported key delivery are used."""
+
     def __init__(self):
         self.binary = os.environ.get("FLIPAUTH_HERDR_BIN", "herdr")
 
     def call(self, session, *arguments):
-        command = [self.binary]
-        if session is not None:
-            command += ["--session", session]
+        command = [self.binary] + (["--session", session] if session is not None else [])
         try:
-            result = subprocess.run([*command, *arguments], capture_output=True, text=True, timeout=5)
-            if result.returncode:
-                accounts.refuse("Herdr command failed; inspect receipt before retrying")
-            return json.loads(result.stdout)
-        except (subprocess.TimeoutExpired, ValueError):
-            accounts.refuse("Herdr receipt unavailable; action outcome needs readback")
-
-    def snapshot(self, session):
-        return self.call(session, "api", "snapshot")["result"]["snapshot"]
+            result = subprocess.run([*command, *arguments], capture_output=True, text=True,
+                                    timeout=5, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            accounts.refuse("Herdr unavailable; Codex CLIs left untouched")
+        if result.returncode:
+            accounts.refuse("Herdr command failed; inspect receipt before retrying")
+        try:
+            return json.loads(result.stdout) if result.stdout.strip() else {}
+        except ValueError:
+            accounts.refuse("Herdr returned unreadable output; inspect receipt before retrying")
 
     def foreground(self, session, pane):
-        return self.call(session, "pane", "process-info", "--pane", pane)["result"]["process_info"]
+        info = self.call(session, "pane", "process-info", "--pane", pane)["result"]["process_info"]
+        return {row.get("pid") for row in info.get("foreground_processes", [])}
 
-    def plan(self, service, running):
-        targets = []
-        covered = set()
-        for session in self.call(None, "session", "list", "--json")["sessions"]:
-            if not session["running"]:
+    def locate(self, pids):
+        """Map each CLI PID to exactly one (session, pane) whose foreground holds it."""
+        found = {}
+        for session in self.call(None, "session", "list", "--json").get("sessions", []):
+            if not session.get("running"):
                 continue
-            snapshot = self.snapshot(session["name"])
-            for agent in snapshot["agents"]:
-                if agent.get("agent") != service:
-                    continue
-                pane = agent["pane_id"]
-                info = self.foreground(session["name"], pane)
-                matched = [p for p in info["foreground_processes"] if p.get("pid") in running]
-                if not matched and not any(p.get("name") == service for p in info["foreground_processes"]):
-                    continue
-                if len(matched) != 1:
-                    accounts.refuse("cannot associate each CLI pane with exactly one live process")
-                process = matched[0]
-                pid = process["pid"]
-                if pid in covered:
-                    accounts.refuse("one process appears in multiple panes")
-                cwd = accounts.local_path(process.get("cwd") or agent.get("foreground_cwd") or agent["cwd"])
-                if not cwd.is_dir():
-                    accounts.refuse("restart working directory no longer exists")
-                start = identity(pid)
-                if start is None:
-                    accounts.refuse("CLI exited during preflight; no sessions stopped, retry from a shell")
-                targets.append({"session": session["name"], "pane": pane, "pid": pid,
-                                "start": start, "cwd": str(cwd), "state": "planned"})
-                covered.add(pid)
-        return targets, covered
+            name = session["name"]
+            snapshot = self.call(name, "api", "snapshot")["result"]["snapshot"]
+            for pane in snapshot.get("panes", []):
+                for pid in self.foreground(name, pane["pane_id"]) & set(pids):
+                    if pid in found:
+                        accounts.refuse("one CLI appears in several Herdr panes; all sessions left untouched")
+                    found[pid] = {"session": name, "pane": pane["pane_id"]}
+        return found
 
-    def still_original(self, target, service):
-        info = self.foreground(target["session"], target["pane"])
-        pids = {p.get("pid") for p in info["foreground_processes"]}
-        if target["pid"] not in processes(service):
-            return False
-        start = identity(target["pid"])
-        if start is None:
-            return False
-        if target["pid"] not in pids or start != target["start"]:
-            accounts.refuse("pane/process ownership changed during switch")
-        return True
-
-    def exit(self, target, service, timeout):
-        if not self.still_original(target, service):
-            return
-        # Cancellation applies to working, idle and blocked states alike. Never answer
-        # an approval dialog. No retry if delivery has an uncertain outcome.
-        try:
-            self.call(target["session"], "agent", "send-keys", target["pane"], "ctrl+c")
-        except accounts.Refused:
-            target["cancel_receipt"] = "unconfirmed"
-        deadline = time.monotonic() + timeout
-        sent_exit = False
-        while time.monotonic() < deadline:
-            if not self.still_original(target, service):
-                return
-            agents = self.snapshot(target["session"])["agents"]
-            state = next((a.get("agent_status") for a in agents if a.get("pane_id") == target["pane"]), None)
-            if state in {"idle", "done"} and not sent_exit:
-                sent_exit = True
-                try:
-                    self.call(target["session"], "agent", "prompt", target["pane"], "/exit")
-                except accounts.Refused:
-                    target["exit_receipt"] = "unconfirmed"
-            time.sleep(.1)
-        accounts.refuse("CLI did not exit after cancellation; no target account started")
+    def send_ctrl_c(self, target):
+        # Agent input (unlike pane input) is rejected by Herdr when the detected agent
+        # no longer controls the pane, narrowing the check-then-send window.
+        self.call(target["session"], "agent", "send-keys", target["pane"], "ctrl+c")
 
 
-def wait_for_launch(herdr, target, service, directory, timeout):
+def locate_in_band(service, clients):
+    """Preflight: every CLI that must quit in-band needs a Herdr pane first."""
+    if service not in IN_BAND_EXIT or not clients:
+        return {}
+    found = Herdr().locate(clients)
+    if set(clients) - set(found):
+        accounts.refuse("a Codex CLI runs outside Herdr and would leave its terminal broken if "
+                        "signaled; exit it with Ctrl+C, then retry; all sessions left untouched")
+    return found
+
+
+def exit_in_band(clients, timeout, changed=lambda: None):
+    """Quit TUIs from their own input so they restore their terminals. Never signals them.
+
+    Ctrl+C goes to every pending pane each round, so several sessions close in
+    parallel. Ctrl+C interrupts a running turn or clears a draft, and a repeated
+    Ctrl+C quits. It is the only key sent; its effect on an approval overlay is
+    expected to be rejection but is not yet observed.
+    """
+    herdr = Herdr()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        info = herdr.foreground(target["session"], target["pane"])
-        observed = processes(service)
-        for proc in info["foreground_processes"]:
-            pid = proc.get("pid")
-            fact = observed.get(pid)
-            if fact and Path(fact["home"]).resolve() == Path(directory).resolve():
-                target["new_pid"] = pid
-                target["new_start"] = fact["start"]
-                return
+
+    def alive(client):
+        return identity(client["pid"]) == client["start"]
+
+    def settle(group):
+        remaining = []
+        for client in group:
+            if alive(client):
+                remaining.append(client)
+            elif client["state"] != "exited":
+                client["state"] = "exited"
+                changed()
+        return remaining
+
+    pending = settle(clients)
+    while pending and time.monotonic() < deadline:
+        for client in pending:
+            if not alive(client):
+                continue
+            foreground = herdr.foreground(client["session"], client["pane"])
+            # The foreground sample may predate an exit: recheck the birth right before sending.
+            if not alive(client):
+                continue
+            if client["pid"] not in foreground:
+                accounts.refuse("pane/process ownership changed; no keys sent")
+            client["key_delivery"] = "unconfirmed"
+            herdr.send_ctrl_c(client)
+            client["key_delivery"] = "acknowledged"
+            client["keys_sent"] = client.get("keys_sent", 0) + 1
+        pause = time.monotonic() + KEY_INTERVAL
+        while any(alive(client) for client in pending) and time.monotonic() < pause:
+            time.sleep(.05)
+        pending = settle(pending)
+    if pending:
+        accounts.refuse("CLI did not quit after Ctrl+C; no signal sent and no new CLI started")
+    for client in clients:
+        while client["pid"] in herdr.foreground(client["session"], client["pane"]):
+            if time.monotonic() >= deadline:
+                accounts.refuse("old pane did not return to its shell; no new CLI started")
+            time.sleep(.05)
+
+
+def stop_managed_daemons(service, root, daemon_starts, timeout):
+    remaining = processes(service)
+    fresh = verified_daemons(service, root)
+    if set(remaining) - fresh or fresh - set(daemon_starts):
+        accounts.refuse("unexpected same-service process appeared; selection unchanged")
+    for pid in daemon_stop_order(set(daemon_starts) & set(remaining), remaining):
+        start = identity(pid)
+        if start is None:
+            continue
+        if start != daemon_starts[pid]:
+            accounts.refuse("daemon PID changed since preflight; no signal sent")
+        fresh = verified_daemons(service, root)
+        current = identity(pid)
+        if current is None:
+            continue
+        if pid not in fresh or current != start:
+            accounts.refuse("managed daemon identity changed; no restart")
+        terminate(pid, start, timeout)
+    deadline = time.monotonic() + timeout
+    while processes(service) and time.monotonic() < deadline:
         time.sleep(.1)
-    accounts.refuse("restart admission observed, but target-home process not confirmed; do not blindly retry")
+    if processes(service):
+        accounts.refuse("same-service processes remain; no restart")
 
 
-def verify_restarted_targets(herdr, targets, service, directory):
-    """Perform a final sweep of every pane and reject extra service processes."""
-    observed = processes(service)
-    expected_home = Path(directory).resolve()
-    expected_pids = {target.get("new_pid") for target in targets}
-    if set(observed) - expected_pids:
-        accounts.refuse("extra same-service process remains; inspect receipt before retrying")
-    for target in targets:
-        pid = target.get("new_pid")
-        fact = observed.get(pid)
-        if (fact is None or fact["start"] != target.get("new_start") or
-                Path(fact["home"]).resolve() != expected_home):
-            accounts.refuse("restart target changed before completion; inspect receipt before retrying")
-        info = herdr.foreground(target["session"], target["pane"])
-        if not any(row.get("pid") == pid for row in info.get("foreground_processes", [])):
-            accounts.refuse("restart pane changed before completion; inspect receipt before retrying")
+def switch_timeout():
+    timeout = float(os.environ.get("FLIPAUTH_SWITCH_STOP_TIMEOUT", "15"))
+    if not 0 < timeout <= 60:
+        accounts.refuse("switch timeout must be between 0 and 60 seconds")
+    return timeout
 
 
-def run_worker(service, script, root, receipt):
-    from short_commands import arguments, receipt_write, require_login, select
-    record = json.loads(receipt.read_text())
+def replace_processes(plan, root, record, receipt):
+    """Preflight the whole service before sending the first termination signal."""
+    from short_commands import receipt_write
+    timeout = switch_timeout()
+    service = plan.service
+    data = accounts.load_registry(root)
+    running = processes(service)
+    daemons = verified_daemons(service, root)
+    if daemons - set(running):
+        accounts.refuse("managed daemon appeared during preflight; no sessions stopped")
+    if set(running) & ancestor_pids():
+        accounts.refuse("switch must run in a separate terminal, outside a running CLI")
+    allowed = {str(Path.home() / ("." + service))}
+    allowed.update(entry["directory"] for entry in data["accounts"][service].values())
+    clients = {pid: fact for pid, fact in running.items() if pid not in daemons}
+    for fact in clients.values():
+        if fact["home"] not in allowed:
+            accounts.refuse("unregistered CLI home; all sessions left untouched")
+        if any(fact["environment"].get(key.encode()) for key in accounts.ENV_CONFLICTS[service]):
+            accounts.refuse("a running CLI has authentication/state overrides; all sessions left untouched")
+        command = fact["command"]
+        options = command[:command.index("--")] if "--" in command else command
+        if any(argument in {"app-server", "remote-control"} for argument in options):
+            accounts.refuse("unmanaged background server found; all sessions left untouched")
+    panes = locate_in_band(service, clients)
+    # All births must still match before any admitted client is stopped.
+    if any(identity(pid) not in (None, fact["start"]) for pid, fact in running.items()):
+        accounts.refuse("process birth changed during preflight; all sessions left untouched")
+    record["stopped_cli"] = [{"pid": pid, "start": fact["start"], "home": fact["home"],
+                              "state": "planned", **({"exit": "ctrl+c", **panes[pid]}
+                                                     if pid in panes else {"exit": "SIGTERM"})}
+                             for pid, fact in clients.items()]
+    record["stopped_daemon"] = [{"pid": pid, "start": running[pid]["start"],
+                                 "home": running[pid]["home"], "state": "planned"} for pid in daemons]
+    record["state"] = "stopping"
+    receipt_write(receipt, record)
     try:
-        timeout = float(os.environ.get("FLIPAUTH_SWITCH_STOP_TIMEOUT", "15"))
-        if not 0 < timeout <= 60:
-            accounts.refuse("switch timeout must be between 0 and 60 seconds")
-        # Parent retains the same lock through worker creation and receipt write.
-        with accounts.service_lock(root, service + "-operation", exclusive=True), contextlib.ExitStack() as gate:
-            gate.enter_context(accounts.service_lock(root, service, exclusive=True))
-            record = json.loads(receipt.read_text())
-            record["state"] = "checking"
+        in_band = [client for client in record["stopped_cli"] if client["exit"] == "ctrl+c"]
+        exit_in_band(in_band, timeout, lambda: receipt_write(receipt, record))
+        for client in record["stopped_cli"]:
+            if client["exit"] != "ctrl+c":
+                terminate(client["pid"], client["start"], timeout)
+            client["state"] = "exited"
             receipt_write(receipt, record)
-            data = accounts.load_registry(root)
-            label = record["target"]
-            args = arguments(label, values=record["arguments"])
-            plan = accounts.prepare_launch(service, script, data, args)
-            binary = plan.executable
-            directory = require_login(service, data, label)
-            running = processes(service)
-            herdr = Herdr()
-            targets, covered = herdr.plan(service, running)
-            daemons = verified_daemons(service, root)
-            if daemons - set(running):
-                accounts.refuse("managed daemon appeared during preflight; no sessions stopped")
-            daemon_starts = {pid: running[pid]["start"] for pid in daemons}
-            if set(running) - covered - daemons:
-                accounts.refuse("unmanaged same-service CLI found; all sessions left untouched")
-            if not targets:
-                accounts.refuse("no restartable CLI pane; selection unchanged; launch directly: " +
-                                "flipauth " + service + " account run " + shlex.quote(label) + " --" +
-                                "; existing background processes are left untouched")
-            for target in targets:
-                environment = process_environment(target["pid"])
-                if any(environment.get(key.encode()) for key in accounts.ENV_CONFLICTS[service]):
-                    accounts.refuse("a target pane has authentication/state overrides; review them before switching")
-            previous = data.get("selected", {}).get(service) or data.get("defaults", {}).get(service)
-            if (previous == label and not daemons and
-                    all(home_of(t["pid"], service) == directory for t in targets)):
-                record["state"] = "already-selected"
-                receipt_write(receipt, record)
-                return
-            record["panes"] = targets
-            record["state"] = "stopping"
-            receipt_write(receipt, record)
-            for target in targets:
-                herdr.exit(target, service, timeout)
-                target["state"] = "stopped"
-                receipt_write(receipt, record)
-            remaining = processes(service)
-            fresh = verified_daemons(service, root)
-            if set(remaining) - fresh or fresh - daemons:
-                accounts.refuse("unexpected same-service process appeared; selection unchanged")
-            for pid in daemon_stop_order(daemons & set(remaining), remaining):
-                start = identity(pid)
-                if start is None:
-                    continue
-                if start != daemon_starts[pid]:
-                    accounts.refuse("daemon PID changed since preflight; no signal sent")
-                fresh = verified_daemons(service, root)
-                current = identity(pid)
-                if current is None:
-                    continue
-                if pid not in fresh or current != start:
-                    accounts.refuse("managed daemon identity changed; no restart")
-                try:
-                    fd = os.pidfd_open(pid)
-                except ProcessLookupError:
-                    continue
-                try:
-                    current = identity(pid)
-                    if current is None:
-                        continue
-                    if current != start:
-                        accounts.refuse("daemon PID reused; no signal sent")
-                    try:
-                        signal.pidfd_send_signal(fd, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                finally:
-                    os.close(fd)
-            deadline = time.monotonic() + timeout
-            while processes(service) and time.monotonic() < deadline:
-                time.sleep(.1)
-            if processes(service):
-                accounts.refuse("same-service processes remain; no restart")
-            # Ensure each destination shell is the only foreground process before
-            # admitting any shell command. A newly opened editor must not receive it.
-            for target in targets:
-                info = herdr.foreground(target["session"], target["pane"])
-                if not info["foreground_processes"] or any(p.get("pid") != info["shell_pid"] for p in info["foreground_processes"]):
-                    accounts.refuse("pane is not back at its shell; no restart commands sent")
-            select(root, service, label)
-            record["state"] = "starting"
-            receipt_write(receipt, record)
-            # Keep the operation mutex while allowing new target-home CLI startups.
-            gate.close()
-            for target in targets:
-                info = herdr.foreground(target["session"], target["pane"])
-                if not info["foreground_processes"] or any(p.get("pid") != info["shell_pid"] for p in info["foreground_processes"]):
-                    accounts.refuse("pane foreground changed before restart submission")
-                command = ("cd -- " + shlex.quote(target["cwd"]) + " && " +
-                           " ".join(map(shlex.quote, ["env", "FLIPAUTH_ACCOUNTS_DIR=" + str(root),
-                              "FLIPAUTH_" + service.upper() + "_BIN=" + str(binary),
-                              str(script), service, "account", "run", label, "--", *record["arguments"]])))
-                target["state"] = "submitting"
-                receipt_write(receipt, record)
-                try:
-                    herdr.call(target["session"], "pane", "run", target["pane"], command)
-                    target["state"] = "admitted"
-                except accounts.Refused:
-                    target["state"] = "admission-unconfirmed"
-                receipt_write(receipt, record)
-                wait_for_launch(herdr, target, service, directory, timeout)
-                target["state"] = "home-verified"
-                receipt_write(receipt, record)
-            verify_restarted_targets(herdr, targets, service, directory)
-            record["state"] = "complete"
-            receipt_write(receipt, record)
-    except (accounts.Refused, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
-        record["state"] = "failed"
-        # Our own errors never include CLI output, config values or credential data.
-        record["error"] = str(exc) if isinstance(exc, accounts.Refused) else type(exc).__name__
+        stop_managed_daemons(service, root,
+                             {pid: running[pid]["start"] for pid in daemons}, timeout)
+    finally:
+        reconcile(record)
         receipt_write(receipt, record)
+
+
+def reconcile(record):
+    """Record each admitted birth's actual outcome, also when stopping failed midway."""
+    for row in record["stopped_cli"] + record["stopped_daemon"]:
+        try:
+            current = identity(row["pid"])
+        except (accounts.Refused, OSError):
+            row["state"] = "unknown"
+            continue
+        row["state"] = "running" if current == row["start"] else "exited"

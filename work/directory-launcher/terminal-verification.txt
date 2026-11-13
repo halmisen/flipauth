@@ -1,0 +1,103 @@
+
+Running flipauth
+
+Running directory-accounts-test.py
+test_alias_dispatch_and_literal_prompt_after_separator (__main__.Accounts.test_alias_dispatch_and_literal_prompt_after_separator) ... ok
+test_bind_idempotence_conflicts_recursion_and_quoting (__main__.Accounts.test_bind_idempotence_conflicts_recursion_and_quoting) ... ok
+test_codex_default_launch_keeps_the_native_home_daemon_enabled (__main__.Accounts.test_codex_default_launch_keeps_the_native_home_daemon_enabled) ... ok
+test_concurrent_add_keeps_both_entries (__main__.Accounts.test_concurrent_add_keeps_both_entries) ... ok
+test_conflicting_environment_settings_and_cli_arguments (__main__.Accounts.test_conflicting_environment_settings_and_cli_arguments) ... ok
+test_default_homes_symlink_retarget_and_missing_directory (__main__.Accounts.test_default_homes_symlink_retarget_and_missing_directory) ... ok
+test_existing_registration_is_idempotent_and_preserves_every_byte (__main__.Accounts.test_existing_registration_is_idempotent_and_preserves_every_byte) ... ok
+test_explicit_config_and_presence_never_claim_identity (__main__.Accounts.test_explicit_config_and_presence_never_claim_identity) ... ok
+test_group_writable_home_is_refused_at_registration_and_launch (__main__.Accounts.test_group_writable_home_is_refused_at_registration_and_launch) ... ok
+test_home_override_and_all_arguments_stdio_working_directory (__main__.Accounts.test_home_override_and_all_arguments_stdio_working_directory) ... ok
+test_independent_accounts_and_official_login (__main__.Accounts.test_independent_accounts_and_official_login) ... ok
+test_interrupt_signals_pid_and_other_process_untouched (__main__.Accounts.test_interrupt_signals_pid_and_other_process_untouched) ... ok
+test_invalid_config_and_symlinked_configuration_do_not_leak (__main__.Accounts.test_invalid_config_and_symlinked_configuration_do_not_leak) ... ok
+test_named_launcher_deployment_and_check_never_start_a_cli (__main__.Accounts.test_named_launcher_deployment_and_check_never_start_a_cli) ... ok
+test_readonly_list_does_not_create_state_or_launch_cli (__main__.Accounts.test_readonly_list_does_not_create_state_or_launch_cli) ... ok
+test_secret_and_provider_templates_are_refused_without_echoing_values (__main__.Accounts.test_secret_and_provider_templates_are_refused_without_echoing_values) ... ok
+test_templates_are_copies_and_exclude_runtime_state (__main__.Accounts.test_templates_are_copies_and_exclude_runtime_state) ... ok
+test_terminal_is_not_replaced_with_pipes (__main__.Accounts.test_terminal_is_not_replaced_with_pipes) ... ok
+test_windows_paths_binaries_symlinks_and_corrupt_registry (__main__.Accounts.test_windows_paths_binaries_symlinks_and_corrupt_registry) ... ok
+
+----------------------------------------------------------------------
+Ran 19 tests in 7.428s
+
+OK
+
+Running launcher-contract-test.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 3.608s
+
+OK
+
+Running magpie-cleanup-test.py
+test_apply_moves_exact_directory_and_repeat_is_noop (__main__.Cleanup.test_apply_moves_exact_directory_and_repeat_is_noop) ... ok
+test_installed_binary_blocks (__main__.Cleanup.test_installed_binary_blocks) ... ok
+test_linked_source_is_refused (__main__.Cleanup.test_linked_source_is_refused) ... ok
+test_live_process_blocks_before_move (__main__.Cleanup.test_live_process_blocks_before_move) ... ok
+test_preview_does_not_write (__main__.Cleanup.test_preview_does_not_write) ... ok
+test_service_or_failed_inspection_blocks (__main__.Cleanup.test_service_or_failed_inspection_blocks) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.531s
+
+OK
+
+Running observation-test.py
+test_empty_process_list_is_not_a_verified_match_and_dead_worker_is_visible (__main__.Observation.test_empty_process_list_is_not_a_verified_match_and_dead_worker_is_visible) ... ok
+test_status_observes_other_home_without_changing_selection_or_credentials (__main__.Observation.test_status_observes_other_home_without_changing_selection_or_credentials) ... ok
+test_unreadable_receipt_does_not_hide_process_observation (__main__.Observation.test_unreadable_receipt_does_not_hide_process_observation) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 1.113s
+
+OK
+
+Running process-state-test.py
+test_codex_code_mode_helper_in_official_release_is_not_a_cli (__main__.ProcFixture.test_codex_code_mode_helper_in_official_release_is_not_a_cli) ... ok
+test_codex_release_family_covers_old_nested_native_binary (__main__.ProcFixture.test_codex_release_family_covers_old_nested_native_binary) ... ok
+test_daemon_pid_record_requires_boot_start_home_and_argv (__main__.ProcFixture.test_daemon_pid_record_requires_boot_start_home_and_argv) ... ok
+test_daemon_stop_order_keeps_updater_before_server (__main__.ProcFixture.test_daemon_stop_order_keeps_updater_before_server) ... ok
+test_default_codex_home_uses_HOME_and_missing_home_refuses (__main__.ProcFixture.test_default_codex_home_uses_HOME_and_missing_home_refuses) ... ok
+test_exit_during_fact_read_is_gone_and_reused_pid_is_refused (__main__.ProcFixture.test_exit_during_fact_read_is_gone_and_reused_pid_is_refused) ... ok
+test_forged_argv0_and_daemon_record_cannot_authorize_an_unrelated_executable (__main__.ProcFixture.test_forged_argv0_and_daemon_record_cannot_authorize_an_unrelated_executable) ... ok
+test_proc_read_reports_a_process_that_just_disappeared (__main__.ProcFixture.test_proc_read_reports_a_process_that_just_disappeared) ... ok
+test_python_tool_with_codex_argument_and_unreadable_env_is_ignored (__main__.ProcFixture.test_python_tool_with_codex_argument_and_unreadable_env_is_ignored) ... ok
+test_same_home_child_is_not_called_claude_without_service_executable (__main__.ProcFixture.test_same_home_child_is_not_called_claude_without_service_executable) ... ok
+test_versioned_claude_uses_real_proc_argv_and_ignores_ps_text (__main__.ProcFixture.test_versioned_claude_uses_real_proc_argv_and_ignores_ps_text) ... ok
+test_wrapper_before_path_does_not_hide_old_claude_release (__main__.ProcFixture.test_wrapper_before_path_does_not_hide_old_claude_release) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.185s
+
+OK
+
+Running short-commands-test.py
+test_busy_clis_and_daemon_stop_before_one_new_cli_and_other_service_survives (__main__.ShortCommands.test_busy_clis_and_daemon_stop_before_one_new_cli_and_other_service_survives) ... ok
+test_claude_closes_old_sessions_and_execs_only_in_the_requesting_terminal (__main__.ShortCommands.test_claude_closes_old_sessions_and_execs_only_in_the_requesting_terminal) ... ok
+test_failed_stop_preserves_selection_and_starts_nothing (__main__.ShortCommands.test_failed_stop_preserves_selection_and_starts_nothing) ... ok
+test_login_creates_home_once_and_imports_no_snapshots (__main__.ShortCommands.test_login_creates_home_once_and_imports_no_snapshots) ... ok
+test_missing_target_login_fails_before_stopping_and_wrapper_conflicts (__main__.ShortCommands.test_missing_target_login_fails_before_stopping_and_wrapper_conflicts) ... ok
+test_named_switch_launcher_restarts_even_the_current_account (__main__.ShortCommands.test_named_switch_launcher_restarts_even_the_current_account) ... ok
+test_non_terminal_switch_is_rejected_before_termination (__main__.ShortCommands.test_non_terminal_switch_is_rejected_before_termination) ... ok
+test_pid_change_after_handle_open_is_not_signaled (__main__.ShortCommands.test_pid_change_after_handle_open_is_not_signaled) ... ok
+test_plain_wrapper_follows_both_switch_directions (__main__.ShortCommands.test_plain_wrapper_follows_both_switch_directions) ... ok
+test_repeated_same_account_commands_each_restart_the_daemon (__main__.ShortCommands.test_repeated_same_account_commands_each_restart_the_daemon) ... ok
+test_reused_pid_is_never_signaled (__main__.ShortCommands.test_reused_pid_is_never_signaled) ... ok
+test_simultaneous_switches_either_launch_or_report_a_process_race (__main__.ShortCommands.test_simultaneous_switches_either_launch_or_report_a_process_race) ... ok
+test_status_distinguishes_login_selection_and_historical_switch (__main__.ShortCommands.test_status_distinguishes_login_selection_and_historical_switch) ... ok
+test_switch_from_inside_a_cli_is_rejected_before_termination (__main__.ShortCommands.test_switch_from_inside_a_cli_is_rejected_before_termination) ... ok
+test_unexpected_process_prevents_daemon_shutdown (__main__.ShortCommands.test_unexpected_process_prevents_daemon_shutdown) ... ok
+test_unregistered_cli_aborts_before_touching_other_clients (__main__.ShortCommands.test_unregistered_cli_aborts_before_touching_other_clients) ... ok
+test_zombie_cli_is_already_stopped_for_both_services (__main__.ShortCommands.test_zombie_cli_is_already_stopped_for_both_services) ... ok
+
+----------------------------------------------------------------------
+Ran 17 tests in 15.247s
+
+OK
+
+Suites/checks: 7; failed: 0

@@ -112,25 +112,40 @@ class Accounts(unittest.TestCase):
         self.assertNotIn("token", json.dumps(registry))
         self.assertFalse(list(self.home.rglob(".active-profile")))
 
-    def test_codex_launch_bypasses_cached_daemon_and_preserves_login(self):
+    def test_codex_default_launch_keeps_the_native_home_daemon_enabled(self):
         directory = self.create()
-        # Model the official CLI's choice between a cached server and a fresh one.
-        binary = Path(self.env['FLIPAUTH_CODEX_BIN'])
-        binary.write_text(FAKE.replace(
-            "arguments = sys.argv[1:]",
-            "arguments = sys.argv[1:]\n"
-            "if '--no-daemon' not in arguments and arguments[:1] != ['login']:\n"
-            "    print('cached daemon: token_revoked', file=sys.stderr)\n"
-            "    sys.exit(41)"))
         self.call('codex', 'run', 'one', '--', 'resume', '--last')
-        self.assertEqual(self.record(directory)['args'], ['--no-daemon', 'resume', '--last'])
-        self.call('codex', 'run', 'one', '--', '--no-daemon', 'a prompt')
-        self.assertEqual(self.record(directory)['args'], ['--no-daemon', 'a prompt'])
-        self.call('codex', 'login', 'one', '--', '--device-auth')
-        self.assertEqual(self.record(directory)['args'], ['login', '--device-auth'])
-        self.call('claude', 'add', 'other', self.home/'claude-other', '--create', '--bare')
-        self.call('claude', 'run', 'other', '--', 'a prompt')
-        self.assertEqual(self.record(self.home/'claude-other')['args'], ['a prompt'])
+        self.assertEqual(self.record(directory)['args'], ['resume', '--last'])
+        self.assertEqual(self.record(directory)['home'], str(directory))
+
+    def test_named_launcher_deployment_and_check_never_start_a_cli(self):
+        self.create('codex','primary')
+        self.create('codex','secondary')
+        script=REPO/'scripts/deploy-launchers.sh'
+        check=['bash',str(script),'codex','--check',str(self.bin)]
+        self.assertNotEqual(subprocess.run(check,env=self.env,capture_output=True).returncode,0)
+        registry=self.root/'registry/accounts.json'
+        before=registry.read_bytes()
+        self.assertFalse((self.bin/'codex-primary').exists())
+        apply=['bash',str(script),'codex',str(self.bin)]
+        first=subprocess.run(apply,env=self.env,capture_output=True,text=True)
+        self.assertEqual(first.returncode,0,first.stderr)
+        saved={name:(self.bin/name).read_bytes() for name in ('codex-primary','codex-secondary')}
+        self.assertTrue(all(b'# flipauth switch launcher' in body for body in saved.values()))
+        for name in saved:
+            body=saved[name].decode()
+            self.assertNotIn('account run',body)
+        registered=json.loads(registry.read_text())
+        original=json.loads(before)
+        self.assertEqual(registered.get('selected'),original.get('selected'))
+        self.assertEqual(registered.get('defaults'),original.get('defaults'))
+        snapshot=registry.read_bytes()
+        for command in (apply,check):
+            result=subprocess.run(command,env=self.env,capture_output=True,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(registry.read_bytes(),snapshot)
+        self.assertEqual(saved,{name:(self.bin/name).read_bytes() for name in saved})
+        self.assertFalse(list(self.home.rglob('called.json')))
 
     def test_explicit_config_and_presence_never_claim_identity(self):
         path = self.home / "new"
@@ -205,7 +220,7 @@ class Accounts(unittest.TestCase):
             arguments = ["--stdin", "a b", "'quoted'", '"double"', "$HOME", "$(touch nope)", "*", "", "--stderr"]
             result = self.call(service, "run", "one", "--", *arguments, env=env, input="input\n", cwd=self.root)
             record = self.record(directory)
-            self.assertEqual(record["args"], (["--no-daemon"] if service == 'codex' else []) + arguments)
+            self.assertEqual(record["args"], arguments)
             self.assertEqual(record["cwd"], str(self.root))
             self.assertEqual(record["stdin"], "input\n")
             self.assertEqual(result.stdout, "cli-stdout\n")
@@ -245,7 +260,7 @@ class Accounts(unittest.TestCase):
         self.call("codex", "bind", "one", launcher)
         self.assertEqual(initial, launcher.read_bytes())
         subprocess.run([str(launcher), "a b", "'", "$HOME", ""], env=self.env, check=True, capture_output=True)
-        self.assertEqual(self.record(directory)["args"], ["--no-daemon", "a b", "'", "$HOME", ""])
+        self.assertEqual(self.record(directory)["args"], ["a b", "'", "$HOME", ""])
         self.call("codex", "bind", "one", self.bin / "codex", ok=False)
         user = self.bin / "user-command"
         user.write_text("mine\n")

@@ -76,41 +76,70 @@ def require_login(service, data, label):
     return directory
 
 
+# Invocations that never open the interactive UI: run them in the named home without
+# switching. Only the first argument is checked; put subcommands first.
+PASS_THROUGH = {
+    "codex": {"exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server",
+              "remote-control", "completion", "update", "doctor", "sandbox", "debug", "apply",
+              "a", "queue", "archive", "delete", "migrate-rollouts", "migrate-nfs-db",
+              "unarchive", "exec-server", "features", "help"},
+    "claude": {"auth", "config", "doctor", "install", "mcp", "migrate-installer", "plugin",
+               "setup-token", "update", "help"},
+}
+PASS_THROUGH_FLAGS = {"--version", "-V", "-v", "--help", "-h"}
+
+
+def passes_through(service, values):
+    if values[:1] and values[0] in PASS_THROUGH[service]:
+        return True
+    # After the official "--", every argument is literal prompt text, never a flag.
+    options = values[:values.index("--")] if "--" in values else values
+    if any(value in PASS_THROUGH_FLAGS for value in options):
+        return True
+    return service == "claude" and any(value in {"-p", "--print"} for value in options)
+
+
 def switch(service, script, root, label, values):
-    from process_state import processes, identity
+    from process_state import identity
+    from session_switch import replace_processes
+    from process_state import processes
+    if passes_through(service, values):
+        # No selection change and nothing stopped: like account run for this home.
+        accounts.launch(service, script, accounts.load_registry(root), arguments(label, values=values))
+        return
+    if not os.isatty(0):
+        accounts.refuse("switch requires a terminal; run the named launcher in a new terminal")
     with accounts.service_lock(root, service + "-operation", exclusive=True), accounts.service_lock(root, service, exclusive=True):
         data = accounts.load_registry(root)
-        args = arguments(label, values=values)
-        plan = accounts.prepare_launch(service, script, data, args)
-        require_login(service, data, label)
-        running = processes(service)
-        if not running:
-            select(root, service, label)
-            # SH lock cannot be acquired while holding our own EX lock. This FD is
-            # CLOEXEC and remains held through the native program replacement.
-            plan.exec()
+        plan = accounts.prepare_launch(service, script, data, arguments(label, values=values))
+        directory = require_login(service, data, label)
         jobs = root / "switches"
         accounts.private_directory(jobs)
         receipt = jobs / (service + "-" + uuid.uuid4().hex + ".json")
-        record = {"service": service, "target": label, "state": "queued",
-                  "arguments": list(values), "panes": []}
+        record = {"service": service, "target": label, "state": "checking",
+                  "cwd": os.getcwd(), "stopped_cli": []}
         receipt_write(receipt, record)
-        log = receipt.with_suffix(".log")
-        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        child_env = os.environ.copy()
-        child_env["FLIPAUTH_ACCOUNTS_DIR"] = str(root)
-        child_env["FLIPAUTH_" + service.upper() + "_BIN"] = str(plan.executable)
-        with os.fdopen(fd, "w") as out:
-            worker = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), service, str(script),
-                 "--worker", str(receipt)], env=child_env, stdin=subprocess.DEVNULL,
-                stdout=out, stderr=out, start_new_session=True,
-            )
-        record["worker_pid"] = worker.pid
-        record["worker_start"] = identity(worker.pid)
-        receipt_write(receipt, record)
-        print("Switch queued; completion is not yet confirmed. Receipt: " + str(receipt), flush=True)
-        print("Check: flipauth " + ("cod" if service == "codex" else "cc") + " status", flush=True)
+        try:
+            target = Path(directory).resolve()
+            running = processes(service)
+            if all(Path(fact["home"]).resolve() == target for fact in running.values()):
+                # Same account (or nothing running): join it; stop nothing, keep its daemon.
+                record["mode"] = "same-account"
+            else:
+                record["mode"] = "account-change"
+                replace_processes(plan, root, record, receipt)
+            if any(Path(fact["home"]).resolve() != target for fact in processes(service).values()):
+                accounts.refuse("same-service process appeared before launch; no new CLI started")
+            select(root, service, label)
+            record.update(state="exec-admitted", pid=os.getpid(), start=identity(os.getpid()))
+            receipt_write(receipt, record)
+            # Both CLOEXEC locks are held until the new official process replaces us.
+            plan.exec()
+        except (accounts.Refused, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as exc:
+            record.update(state="failed", error=str(exc) if isinstance(exc, accounts.Refused)
+                          else type(exc).__name__)
+            receipt_write(receipt, record)
+            raise
 
 
 def status(service, root, as_json=False):
@@ -148,6 +177,10 @@ def status(service, root, as_json=False):
             record = json.loads(receipts[-1].read_text())
             report["last_switch"] = {"state": record["state"], "target": record["target"],
                 "error": record.get("error"), "receipt": str(receipts[-1])}
+            if record["state"] == "exec-admitted":
+                report["last_switch"]["launch_observed"] = any(
+                    row["pid"] == record.get("pid") and row["start_ticks"] == record.get("start")
+                    and row["account"] == record["target"] for row in report["processes"])
             if record["state"] in {"queued", "checking", "stopping", "starting"}:
                 worker_start = record.get("worker_start")
                 report["last_switch"]["worker_alive"] = (
@@ -181,6 +214,8 @@ def status(service, root, as_json=False):
         if record.get("error"):
             print("reason: " + record["error"])
         print("receipt: " + record["receipt"])
+        if "launch_observed" in record:
+            print("target CLI currently observed: " + str(record["launch_observed"]).lower())
         if record.get("worker_alive") is False:
             print("switch worker is no longer running; inspect this receipt before retrying")
         print("Login does not update the last switch receipt.")
@@ -191,18 +226,12 @@ def main():
     values = sys.argv[3:]
     script = Path(executable).resolve()
     root = accounts.local_path(os.environ.get("FLIPAUTH_ACCOUNTS_DIR", str(Path.home() / ".local/state/flipauth")))
-    if values[:1] == ["--worker"]:
-        from session_switch import run_worker
-        path = accounts.local_path(values[1])
-        if path.parent != root / "switches" or not path.name.startswith(service + "-"):
-            accounts.refuse("invalid worker receipt")
-        run_worker(service, script, root, path)
-        return
     if not values or values == ["--help"]:
         print("Usage: flipauth <cod|cc> <NAME> [login] [-- CLI arguments]\n"
               "       flipauth <cod|cc> new <NAME>\n"
               "       flipauth <cod|cc> status [--json]|list\n"
-              "Switch replaces all verified same-service Herdr CLI sessions, including busy ones.\n"
+              "Same account: opens one more CLI. Another account running: stops all same-service CLIs and\n"
+              "daemons first. Subcommands such as exec/login/--version run without switching.\n"
               "Login creates a fresh named directory if absent. No legacy snapshots are imported.")
         return
     if values in (["status"], ["status", "--json"]):

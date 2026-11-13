@@ -33,7 +33,7 @@ def identity(pid):
         if not fields or fields[0] in {"Z", "X"}:
             return None
         return int(fields[19])
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     except (IndexError, ValueError):
         accounts.refuse("cannot inspect process identity")
@@ -44,10 +44,24 @@ def process_environment(pid):
     try:
         return dict(item.split(b"=", 1) for item in
                     (proc / "environ").read_bytes().split(b"\0") if b"=" in item)
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return {}
     except PermissionError:
         accounts.refuse("cannot inspect process environment")
+
+
+def ancestor_pids():
+    """A switch must not terminate the CLI whose tool shell is invoking it."""
+    pid = os.getpid()
+    ancestors = set()
+    while pid > 1 and pid not in ancestors:
+        ancestors.add(pid)
+        try:
+            fields = (_proc(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+            pid = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            accounts.refuse("cannot establish switch caller ancestry; no sessions stopped")
+    return ancestors
 
 
 def home_of(pid, service):
@@ -70,7 +84,7 @@ def _home_from_environment(env, service):
 def _argv(pid):
     try:
         raw = (_proc(pid) / "cmdline").read_bytes()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return []
     return [os.fsdecode(item) for item in raw.split(b"\0") if item]
 

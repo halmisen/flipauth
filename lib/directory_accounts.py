@@ -380,12 +380,6 @@ def prepare_launch(service, script, data, args):
     # executable has a version-number basename. Scope the hint to this child.
     env["HERDR_AGENT"] = service
     prefix = (["auth", "login"] if service == "claude" else ["login"]) if args.command == "login" else []
-    if service == "codex" and args.command == "run":
-        # A managed daemon retains its auth snapshot across separate CLI logins.
-        # Start a fresh server with this home instead of reconnecting to that cache.
-        options = arguments[:arguments.index("--")] if "--" in arguments else arguments
-        if "--no-daemon" not in options:
-            prefix = ["--no-daemon"]
     return LaunchPlan(service, args.name, directory, binary,
                       (str(binary), *prefix, *arguments), env)
 
@@ -408,10 +402,10 @@ def launch(service, script, data, args):
 
 def bind(service, script, root, data, args):
     account(data, service, args.name)
-    bind_launcher(service, script, root, args.path, args.name)
+    bind_launcher(service, script, root, args.path, args.name, args.switch, args.check)
 
 
-def bind_launcher(service, script, root, value, label=None):
+def bind_launcher(service, script, root, value, label=None, switch=False, check=False):
     target_input = Path(value).expanduser()
     if target_input.is_symlink():
         refuse("launcher target is a symlink; nothing replaced")
@@ -430,11 +424,20 @@ def bind_launcher(service, script, root, value, label=None):
     binary = cli_binary(service, script)
     if target == binary or target.resolve() == binary.resolve():
         refuse("cannot replace the official executable; choose a separate PATH directory")
-    words = [str(script), service, "account", "current"] if label is None else [str(script), service, "account", "run", label]
-    marker = "current" if label is None else "directory"
+    if switch:
+        words = [str(script), service, label]
+        marker = "switch"
+    else:
+        words = [str(script), service, "account", "current"] if label is None else [str(script), service, "account", "run", label]
+        marker = "current" if label is None else "directory"
     body = ("#!/bin/sh\n# flipauth " + marker + " launcher v1\n" +
             "export FLIPAUTH_ACCOUNTS_DIR=" + shlex.quote(str(root)) + "\n" +
             "exec " + " ".join(map(shlex.quote, [*words, "--"])) + ' "$@"\n')
+    if check:
+        if not target.is_file() or target.read_text() != body or not os.access(target, os.X_OK):
+            refuse("launcher missing or differs from source: " + str(target))
+        print("verified: " + str(target))
+        return
     existed = target.exists()
     if existed:
         regular(target)
@@ -476,6 +479,10 @@ def main():
     p = sub.add_parser("bind", help="create an optional executable launcher at an explicit path")
     p.add_argument("name", type=name)
     p.add_argument("path")
+    p.add_argument("--switch", action="store_true",
+                   help="on an account change, close all same-service sessions and daemons first; "
+                        "same account just opens one more")
+    p.add_argument("--check", action="store_true", help="read-only launcher drift check")
     p = sub.add_parser("current", help="launch the selected directory; used by the optional CLI wrapper")
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p = sub.add_parser("bind-current", help="create an optional codex/claude wrapper that follows selection")

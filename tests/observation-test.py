@@ -23,6 +23,9 @@ class Observation(unittest.TestCase):
     short = fixtures.ShortCommands.short
     setup_accounts = fixtures.ShortCommands.setup_accounts
     start = fixtures.ShortCommands.start
+    pump_terminals = fixtures.ShortCommands.pump_terminals
+    stop_pump = fixtures.ShortCommands.stop_pump
+    locked_state = fixtures.ShortCommands.locked_state
 
     def test_status_observes_other_home_without_changing_selection_or_credentials(self):
         first, second = self.setup_accounts()
@@ -33,8 +36,9 @@ class Observation(unittest.TestCase):
         report = json.loads(self.short("cod", "status", "--json").stdout)
         self.assertEqual(report["selected"], "primary")
         self.assertFalse(report["selection_matches_processes"])
-        self.assertEqual([(p["pid"], p["account"], p["home"]) for p in report["processes"]],
+        self.assertEqual([(p["pid"], p["account"], p["home"]) for p in report["processes"] if p["role"] == "cli"],
                          [(process.pid, "secondary", str(second))])
+        self.assertEqual(len(report["processes"]), 3)  # CLI plus native server/updater stand-ins.
         self.assertEqual(report["identity"], "unverified")
         self.assertIn("selection differs", self.short("cod", "status").stdout)
         self.assertEqual(before, registry.read_bytes())

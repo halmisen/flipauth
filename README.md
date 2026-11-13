@@ -30,8 +30,8 @@ Python packages, server or background service is installed.
 ln -s "$HOME/projects/flipauth/flipauth" "$HOME/.local/bin/flipauth"
 ```
 
-Session replacement needs local Herdr. Stopping an existing managed Codex daemon also
-requires Linux/Python pidfd support. Native Windows and macOS are outside the supported scope.
+Session replacement requires Linux/Python pidfd support and a separate terminal.
+Native Windows and macOS are outside the supported scope.
 
 ## Register and log in
 
@@ -96,14 +96,24 @@ flipauth cod secondary
 flipauth cc primary
 ```
 
-If no same-service process exists, this selects the home and starts the official CLI
-in the current terminal. Otherwise, a bounded detached worker preflights every existing
-CLI, cancels its task, requests normal exit, verifies shutdown, commits selection,
-and starts fresh conversations in the original Herdr panes and project directories.
-The other service is left alone. File edits already made by interrupted tasks remain.
-Cross-account conversation resume is not implemented.
+Run these commands in a separate terminal, outside any running agent's tool shell.
+They preflight all same-service processes, close old CLIs, wait for exit, then stop verified managed daemon updaters and servers. A fresh official CLI
+starts only in the requesting terminal and working directory. Old terminals return
+to their shells. If only the target account (or nothing) is running, the command just
+opens one more CLI and stops nothing; daemons are stopped only on an account change.
+Subcommands such as `exec`, `login`, `mcp` and `--version` run in that account without
+switching. Ctrl+C reaches all old Codex panes in parallel. The other service is
+left alone; file edits already made by interrupted tasks remain.
 
-The immediate output is a receipt, not completion. Inspect it with:
+Codex only restores its terminal when it quits from keyboard input, so old Codex CLIs
+must run in Herdr panes: FlipAuth sends Ctrl+C through `herdr agent send-keys` until
+each one quits (interrupting a busy turn first). A Codex CLI in any other terminal
+refuses the switch before anything stops; quit it yourself and retry. Old Claude CLIs
+restore their terminal on SIGTERM and are closed that way from any terminal.
+
+FlipAuth does not explicitly start a new daemon and does not force `--no-daemon`.
+The new official CLI handles its normal daemon startup. Cross-account conversation
+resume is not implemented. From another terminal, inspect local process facts with:
 
 ```sh
 flipauth cod status
@@ -112,18 +122,17 @@ flipauth cc status --json
 
 Status shows selection, initial default, login-file presence, observed PID/home/account
 associations and the last switch receipt. It warns when observed homes differ from
-selection. `complete` means every target was rechecked as a new process in the target
-home; it does not mean provider identity, UI readiness or a request was verified.
+selection. `exec-admitted` records the handoff to the official executable;
+`launch_observed` separately checks the recorded PID, birth and account home.
+Neither establishes provider identity, UI readiness or a successful request.
 
-Unknown or unmanaged processes cause refusal before stopping any session. Herdr is
-used for pane ownership and normal terminal interaction, not as an account identity
-source. Unrecognized/blocked UI is never answered automatically. Only exactly verified
-Codex managed daemons receive SIGTERM, after the TUIs exit; SIGKILL is never used.
-Uncertain command delivery is read back, not repeated. A failed restart can leave some
-panes stopped and selection committed; read its receipt before deciding on recovery.
+Unregistered CLI homes, uninspectable processes or unmanaged background servers
+cause refusal before termination. PID reuse is checked before opening a pidfd and
+again before SIGTERM. Codex CLIs are never signaled. SIGKILL is never used. Failure can leave old sessions stopped;
+read the receipt before deciding on recovery. Receipts live under
+`~/.local/state/flipauth/switches/`, or the configured registry directory.
 
-Directory Codex launches use `--no-daemon`, avoiding reuse of a server's cached login.
-A pre-existing daemon is not stopped by an ordinary launch. Each launch uses the
+A pre-existing daemon is not stopped by an ordinary `account run` launch. Each launch uses the
 stable official executable entry, allowing normal upgrades, and sets a child-scoped
 `HERDR_AGENT` hint so a version-named native binary remains recognizable to Herdr.
 
@@ -134,6 +143,19 @@ A fixed account launcher never switches other sessions:
 ```sh
 flipauth codex account bind secondary "$HOME/.local/bin/codex-secondary"
 ```
+
+To make the named launcher replace old sessions instead, add `--switch` when creating
+it. Existing files with different contents are refused. Deploy named switch launchers
+for all registered accounts of one service, without launching or stopping anything:
+
+```sh
+bash scripts/deploy-launchers.sh codex
+bash scripts/deploy-launchers.sh codex --check
+```
+
+This creates `codex-<name>` commands and leaves the plain official `codex` command alone.
+Use `claude` as the script argument for Claude launchers. An existing ordinary launcher
+is not silently converted into a switch command.
 
 To make plain `codex` follow the selection, stage a separate wrapper:
 
@@ -154,7 +176,7 @@ wrappers, so installing one does not break direct `account run/login` calls.
 | `FLIPAUTH_ACCOUNTS_DIR` | Registry and receipts; default `~/.local/state/flipauth` |
 | `FLIPAUTH_CODEX_BIN` | Explicit official Codex entry; prefer its stable symlink |
 | `FLIPAUTH_CLAUDE_BIN` | Explicit official Claude entry; prefer its stable symlink |
-| `FLIPAUTH_SWITCH_STOP_TIMEOUT` | Per-target stop/start deadline, 1–60 seconds |
+| `FLIPAUTH_SWITCH_STOP_TIMEOUT` | Per-process shutdown deadline, greater than 0 and at most 60 seconds |
 
 Registry names, executable paths and configuration provenance contain no credentials.
 Keep local account labels and notes out of this public repository.

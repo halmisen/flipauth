@@ -1,0 +1,93 @@
+# 终端退出修正验证 2026-11-13T10:13:59+08:00 local-wsl
+## RED: 新测试 + 修正前 SIGTERM 实现（session_switch.old.py 由修正后文件剥离 Herdr 路径重建）
+FAIL: test_busy_clis_and_daemon_stop_before_one_new_cli_and_other_service_survives (__main__.ShortCommands.test_busy_clis_and_daemon_stop_before_one_new_cli_and_other_service_survives)
+AssertionError: -15 != 0
+FAIL: test_codex_outside_herdr_is_refused_before_any_cli_or_daemon_stops (__main__.ShortCommands.test_codex_outside_herdr_is_refused_before_any_cli_or_daemon_stops)
+AssertionError: 0 == 0
+FAIL: test_failed_stop_preserves_selection_and_starts_nothing (__main__.ShortCommands.test_failed_stop_preserves_selection_and_starts_nothing)
+AssertionError: 0 == 0
+FAIL: test_named_switch_launcher_restarts_even_the_current_account (__main__.ShortCommands.test_named_switch_launcher_restarts_even_the_current_account)
+AssertionError: -15 != 0
+FAIL: test_old_codex_pane_gets_its_terminal_back (__main__.ShortCommands.test_old_codex_pane_gets_its_terminal_back)
+AssertionError: Items in the first set but not the second:
+FAIL: test_zombie_cli_is_already_stopped_for_both_services (__main__.ShortCommands.test_zombie_cli_is_already_stopped_for_both_services)
+AssertionError: -15 != 0
+Ran 19 tests in 11.504s
+FAILED (failures=6)
+
+## GREEN: 修正后完整离线套件
+Ran 19 tests in 7.564s
+OK
+Ran 6 tests in 3.677s
+OK
+Ran 6 tests in 0.387s
+OK
+Ran 3 tests in 1.045s
+OK
+Ran 12 tests in 0.213s
+OK
+Ran 19 tests in 20.268s
+OK
+Suites/checks: 7; failed: 0
+
+## sha256
+7a9887f5f7cf6766e3194902a9f7d7d6d88362061edf92bcf8f1166f2fca52cf  lib/session_switch.py
+7d1dcf0f7a872400d312fa0d5bde666b82e5844e40b2bb89f5bb19a52020578e  tests/short-commands-test.py
+b264ea237821d8af6e2ea0a6ec4f155c0c706f029a909f43fded18c45dda3c18  tests/observation-test.py
+a27986ae6aeb1538713d07df82a81aab3d7c9e15b46d2c658280355ca878e9f0  work/directory-launcher/native-terminal-probe.py
+
+# 只在换账号时清场 2026-11-13T10:37:52+08:00 local-wsl
+## RED: 新用例 + 上一版实现（同账号也重启、无直通、串行 Ctrl+C）
+ERROR: test_account_change_closes_every_pane_in_parallel_and_all_daemons (__main__.ShortCommands.test_account_change_closes_every_pane_in_parallel_and_all_daemons)
+ERROR: test_named_launcher_for_the_running_account_joins_without_stopping_anything (__main__.ShortCommands.test_named_launcher_for_the_running_account_joins_without_stopping_anything)
+ERROR: test_switch_back_stops_the_other_accounts_daemon (__main__.ShortCommands.test_switch_back_stops_the_other_accounts_daemon)
+FAIL: test_non_interactive_subcommands_never_switch (__main__.ShortCommands.test_non_interactive_subcommands_never_switch)
+FAIL: test_repeated_same_account_commands_keep_the_daemon (__main__.ShortCommands.test_repeated_same_account_commands_keep_the_daemon)
+Ran 22 tests in 22.595s
+FAILED (failures=2, errors=3)
+## RED: 并行用例 + 串行 Ctrl+C
+AssertionError: Items in the second set but not the first:
+Ran 1 test in 4.406s
+FAILED (failures=1)
+## GREEN
+Ran 19 tests in 6.838s
+OK
+Ran 6 tests in 3.249s
+OK
+Ran 6 tests in 0.398s
+OK
+Ran 3 tests in 1.044s
+OK
+Ran 12 tests in 0.189s
+OK
+Ran 22 tests in 19.218s
+OK
+Suites/checks: 7; failed: 0
+## 实测：两个一次性 Herdr pane，未登录 Codex，并行退出 0.53 s，keys_sent 各 2，前台回到 shell
+7d5f406e937370c22300c5e301561f9104b431689ba48d5ad62cbcce9505d144  lib/session_switch.py
+1510727fb10fe574ea225effd21c83322a94da2fc4ab25eac6df7af1d2315160  lib/short_commands.py
+b9a0bebec4c453a4494d51d326168ee056fe4cfd9dc51832dd8709492be71f47  tests/short-commands-test.py
+
+# 独立只读审查修复 2026-11-13T11:07:20+08:00 local-wsl
+## RED: 3 项新用例 + 修复前代码（发键改为 agent send-keys 以匹配新假 herdr）
+FAIL: test_failed_stop_receipt_records_each_actual_outcome (__main__.ShortCommands.test_failed_stop_receipt_records_each_actual_outcome)
+AssertionError: {119783: 'planned', 119786: 'planned'} != {119783: 'exited', 119786: 'running'}
+FAIL: test_key_is_not_sent_when_the_cli_exits_during_the_foreground_query (__main__.ShortCommands.test_key_is_not_sent_when_the_cli_exits_during_the_foreground_query)
+AssertionError: Expected 'send_ctrl_c' to not have been called. Called 1 times.
+FAIL: test_flags_after_the_official_separator_are_prompt_text (__main__.ShortCommands.test_flags_after_the_official_separator_are_prompt_text)
+AssertionError: True is not false : ['--', '--help']
+Ran 3 tests in 2.844s
+FAILED (failures=3)
+## GREEN
+Ran 19 tests in 6.513s
+Ran 6 tests in 3.221s
+Ran 6 tests in 0.387s
+Ran 3 tests in 1.020s
+Ran 12 tests in 0.181s
+Ran 25 tests in 22.096s
+Suites/checks: 7; failed: 0
+## 实测：一次性 Herdr pane 未登录 Codex，agent send-keys 退出 0.57 s，回执回调 exited；退出后 agent send-keys 被 Herdr 拒绝
+d62bbd7b388541f5819a99b57ee1d781289484674dfd5ddf2a631cb604b3ea8a  lib/session_switch.py
+97ded141d40214099f2ec7ef428c7494011746bf63299bf0d4895ac3a60e98f0  lib/short_commands.py
+56059843fbae75a0a04d915bbf25b513d12bb402a1e351a595260589c539aae3  lib/directory_accounts.py
+0d96003294acdd1529a165c1eb4356a7342960f8b48aec9f7adac3c2ce147493  tests/short-commands-test.py

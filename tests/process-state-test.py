@@ -77,6 +77,14 @@ class ProcFixture(unittest.TestCase):
         self.assertEqual(facts[self.pid]["argv"][-1], "don't parse me")
         self.assertEqual(facts[self.pid]["home"], str((self.root / "claude-alpha").resolve()))
 
+    def test_proc_read_reports_a_process_that_just_disappeared(self):
+        self.add_proc([str(self.claude)], {"HOME": str(self.root / "home")})
+        with mock.patch.object(Path, "read_text", side_effect=ProcessLookupError):
+            self.assertIsNone(process_state.identity(self.pid))
+        with mock.patch.object(Path, "read_bytes", side_effect=ProcessLookupError):
+            self.assertEqual(process_state.process_environment(self.pid), {})
+            self.assertEqual(process_state._argv(self.pid), [])
+
     def test_wrapper_before_path_does_not_hide_old_claude_release(self):
         newer = self.bin / "versions" / "2.1.322"
         newer.write_text("new fake")

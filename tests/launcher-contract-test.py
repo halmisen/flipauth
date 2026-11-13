@@ -126,17 +126,14 @@ class LauncherContract(unittest.TestCase):
             self.assertEqual(wrapper_result.returncode, 0, wrapper_result.stderr)
             self.assertEqual(
                 self.calls(homes[service])[-1]["args"],
-                (["--no-daemon"] if service == "codex" else []) + ["through-path-wrapper"],
+                ["through-path-wrapper"],
             )
 
-        # Short aliases and current selection use the same plan, including the
+        # Current selection uses the same plan, including the
         # stable executable behind the PATH wrapper.
-        self.cli("cc", "one", "--", "short")
-        self.cli("cod", "one", "--", "short")
         self.cli("claude", "account", "current", "--", "current")
         self.cli("codex", "account", "current", "--", "current")
         for service in ("claude", "codex"):
-            self.assertTrue(any(call["args"][-1] == "short" for call in self.calls(homes[service])))
             self.assertTrue(any(call["args"][-1] == "current" for call in self.calls(homes[service])))
 
         # A fixed account launcher also remains usable after the dynamic PATH
@@ -144,7 +141,7 @@ class LauncherContract(unittest.TestCase):
         fixed = self.root / f"fixed-{service}"
         self.cli("codex", "account", "bind", "one", fixed)
         self.assertEqual(subprocess.run([str(fixed), "fixed"], env=self.env, check=True).returncode, 0)
-        self.assertEqual(self.calls(homes["codex"])[-1]["args"], ["--no-daemon", "fixed"])
+        self.assertEqual(self.calls(homes["codex"])[-1]["args"], ["fixed"])
 
     def test_wrapper_re_resolves_stable_symlink_after_provider_upgrade(self):
         home = self.account("claude", "one", default=True)
