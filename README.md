@@ -106,10 +106,12 @@ switching. Ctrl+C reaches all old Codex panes in parallel. The other service is
 left alone; file edits already made by interrupted tasks remain.
 
 Codex only restores its terminal when it quits from keyboard input, so old Codex CLIs
-must run in Herdr panes: FlipAuth sends Ctrl+C through `herdr agent send-keys` until
-each one quits (interrupting a busy turn first). A Codex CLI in any other terminal
-refuses the switch before anything stops; quit it yourself and retry. Old Claude CLIs
-restore their terminal on SIGTERM and are closed that way from any terminal.
+must run in Herdr panes: FlipAuth queries Herdr pane state and sends `Esc` through
+`herdr agent send-keys` while Codex is `working` (interrupting active turns or
+dismissing the running-task modal), then sends `Ctrl+C` until each one quits cleanly
+and rejects trust/approval overlays without confirming. A Codex CLI in any other
+terminal refuses the switch before anything stops; quit it yourself and retry. Old
+Claude CLIs restore their terminal on SIGTERM and are closed that way from any terminal.
 
 FlipAuth does not explicitly start a new daemon and does not force `--no-daemon`.
 The new official CLI handles its normal daemon startup. Cross-account conversation
@@ -220,12 +222,31 @@ facts, managed daemon ownership and session replacement. They never log into an
 account or stop real agent processes. Removed snapshot/quota features are tested
 for refusal rather than by retaining their old implementation.
 
+## Troubleshooting
+
+Inspect live state and the latest receipt before changing configuration:
+
+```sh
+flipauth cod status --json
+ls -lt "$HOME/.local/state/flipauth/switches" | head
+```
+
+- **Old CLI stayed open and receipt shows `"stopped_cli": []`**: FlipAuth did not recognize that running CLI binary (not a home-directory error). Ensure `accounts.json` and `FLIPAUTH_CODEX_BIN` / `FLIPAUTH_CLAUDE_BIN` point to the stable entrypoint (such as nvm's `bin/codex`, not a release or `vendor/.../bin/codex` subpath); npm `@openai/codex` on Node 24+ uses `process.execve` into `vendor/<triple>/bin/codex`, which FlipAuth matches in `lib/process_state.py`.
+- **Switch failed with `CLI did not quit after Esc/Ctrl+C`**: Read the pane screen to see which modal blocked exit. Active `working` turns require `Esc` before `Ctrl+C` because `Ctrl+C` during a turn opens Codex's `"Task is still running"` dialog and ignores further `Ctrl+C` presses.
+- **Repeated folder-trust prompt (`Trust this folder?`) on a new account home**: New `--bare` homes start with an empty `[projects]` table in `config.toml`; trust each project once in Codex or add `[projects."/abs/path"]` (`trust_level = "trusted"`) in that account home's `config.toml`.
+- **`a Codex CLI runs outside Herdr`**: Close headless or non-Herdr Codex sessions first so switching never leaks mouse/alternate-screen escape sequences into another terminal.
+
 ## 简体中文
 
 FlipAuth 为每个账号指定独立目录，启动原生 Claude Code 或 Codex。登录、刷新和请求
 由官方客户端完成。`account run` 单独启动指定账号；`cod/cc NAME` 明确切换同服务全部
-会话。`status` 分别显示启动选择和实际进程目录，不把账号标签当成真实身份验证。
+会话（对 Herdr 内正处于 `working` 回合的 Codex 先发 `Esc` 中断，再发 `Ctrl+C` 退出）。
+`status` 分别显示启动选择和实际进程目录，不把账号标签当成真实身份验证。
 不使用网关，不复制凭据，不查询配额，不自动安装 PATH 包装或修改已有登录。
+
+排查异常先执行 `flipauth cod status --json`（或 `cc`）并查看 `~/.local/state/flipauth/switches/*.json` 回执：
+- 若旧进程没退且回执里 `"stopped_cli": []`，通常是 FlipAuth 的进程识别未匹配该二进制布局（如 Node 24 + npm `@openai/codex` 通过 `process.execve` 跳到 `vendor/<triple>/bin/codex`），属 FlipAuth 识别缺陷而非用户目录配错；保持 `accounts.json` 指向稳定入口 `bin/codex` 即可。
+- 若新增裸目录每次提示 `Trust this folder?`，在对应账号目录 `config.toml` 的 `[projects."<项目绝对路径>"]` 写入 `trust_level = "trusted"` 即可。
 
 ## License
 

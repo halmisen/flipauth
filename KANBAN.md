@@ -31,7 +31,7 @@
 - `scripts/deploy-launchers.sh <service> [--check]` 部署所有已登记账号的命名切换入口；
   普通服务命令不被替换，部署不触发实际切换或改变选择。
 - 切换需要独立 TTY，拒绝从待关闭 CLI 的工具子进程触发；先预检所有已知进程归属，
-  Codex CLI 必须在 Herdr pane 内，经 `herdr agent send-keys` 发 Ctrl+C 正常退出（否则预检拒绝）；
+  Codex CLI 必须在 Herdr pane 内，经 `herdr agent send-keys` 带内退出（`working` 时先发 `Esc` 中断回合或退出 `Task is still running` 弹窗，非 `working` 时发 `Ctrl+C`；否则预检拒绝）；
   Claude CLI 用 pidfd SIGTERM（原生已验证会恢复终端）；等待退出后，最后按 updater → server 停止有官方 PID 记录的 daemon。
 - 无 detached worker 或旧 pane 重开；不强制 `--no-daemon`，不显式启动新 daemon。
   进程重用、未知归属、停不掉或启动前出现新进程时留下失败回执，不强杀、不自动重试。
@@ -44,4 +44,10 @@
 2026-11-13 用户在 `workman` 实机试切后报告旧终端残留界面并刷控制序列，随后切回原账号；根因为 Codex 对外部信号不恢复终端，Claude 收 SIGTERM 会恢复。同日 Claude 在 `d7806f4` 改为 Codex 经 Herdr Ctrl+C 退出。
 2026-11-13 晚在 `halmi-home`（npm `@openai/codex 0.169.0` + Node `v24.22.3`）首次真机热切换实测时，发现 `codex.js` 调用 `process.execve` 替换成 `vendor/<triple>/bin/codex`，原进程识别漏掉该路径导致旧 CLI 未收到 Ctrl+C；已在 `lib/process_state.py` 新增 `_codex_npm_vendors` 与回归测试并复验通过。
 随后实机连续完成两次已登录会话热切换（`codex-sen` → `codex-az` → `codex-sen`，跨 `wJ:pP` / `wJ:pN`）：两次旧 CLI 均经 `herdr agent send-keys ctrl+c` 退出（`key_delivery: acknowledged`），旧终端干净退回 shell，旧 `app-server` 守护进程全部退出，新账号 CLI 与自动守护进程均被 `status` 观测到（`launch_observed: true`）。
-仍未实测：Codex 处于思考/工具调用或审批弹窗中切换、已登录 Claude 多账号切换，以及 `workman` 拉取本修复后的复验。
+同晚经 Herdr 实测更多边界并补修两处源码缺陷：
+- 授权/信任遮罩（`blocked`：`Folder access` 与 `Would you like to run ...?` 提权命令弹窗）：实测 `Ctrl+C` 不确认执行直接撤回并干净退出；修补后在 `Would you like to run ...?`（`curl -sI https://example.com`）下切账号再次通过（`keys_sent: 2`，回执 `codex-27acb59b5f58409492be19ff84185d80.json`）。
+- 活跃回合与退出窗竞态（`working` + `Task is still running` 弹窗）：Codex `0.169.0` 在回合中收 `Ctrl+C` 会弹出 `Task is still running` 并忽略后续全部 `Ctrl+C`（`keys_sent: 30` 失败）；`lib/session_switch.py` 先改为 `working` 发 `Esc`（实测 `Working sleep 30` 清场双端一次通过，`codex-26a8100611124c038fdaa8a8229de2c6.json`）。随后在预置 `Task is still running` 弹窗复测中捕获到第 4 轮 `agent send-keys` 与 CLI 正好退出（`agent_not_found`）撞车报错（`codex-a21073ce3a014cbe8797c840c27d80c4.json`），再在 `lib/session_switch.py` 补上发键拒收后短暂确认退出的竞态恢复（`short-commands-test.py` 先红后绿通过 30 项）。修补后预置 `Task is still running` 弹窗脱困切出（`codex-26c4f774f8664ad384ce62a192d17539.json`）、直通 `--version`、同账号并行接入及双端并切全部真机通过。
+- 已将两份 Codex 账号 `config.toml`（`~/.codex` 与 `~/.codex-az`）对 `~/projects/*` 等 33 个目录补齐 `trust_level = "trusted"`。
+待办：
+- Claude 多账号切换真机实测（`halmi-home` 目前仅配置单账号，待加第二个账号后补测）；
+- `workman` 拉取 `feature/directory-launcher` 最新提交并复验。

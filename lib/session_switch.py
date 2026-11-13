@@ -6,9 +6,11 @@ relaunch, conversation resume, credential copy or SIGKILL is involved.
 Codex restores its terminal (raw mode, alternate screen, focus/paste/mouse
 reporting) only when it quits from its own keyboard input; every external signal
 kills it with those modes still enabled in the old terminal. Codex CLIs are
-therefore closed with Ctrl+C delivered through Herdr's supported key API, and a
-Codex CLI outside a Herdr pane is refused before anything is stopped. Claude
-restores its terminal on SIGTERM, so Claude CLIs keep the pidfd path.
+therefore closed in-band through Herdr's supported key API (Esc while `working`
+to interrupt an active turn or dismiss its running-task modal, then Ctrl+C to
+quit), and a Codex CLI outside a Herdr pane is refused before anything is
+stopped. Claude restores its terminal on SIGTERM, so Claude CLIs keep the pidfd
+path.
 """
 
 import json
@@ -97,10 +99,22 @@ class Herdr:
                     found[pid] = {"session": name, "pane": pane["pane_id"]}
         return found
 
-    def send_ctrl_c(self, target):
+    def pane_statuses(self, session):
+        snapshot = self.call(session, "api", "snapshot")["result"]["snapshot"]
+        return {pane["pane_id"]: pane.get("agent_status") for pane in snapshot.get("panes", [])}
+
+    def _send_key(self, target, key):
         # Agent input (unlike pane input) is rejected by Herdr when the detected agent
         # no longer controls the pane, narrowing the check-then-send window.
-        self.call(target["session"], "agent", "send-keys", target["pane"], "ctrl+c")
+        self.call(target["session"], "agent", "send-keys", target["pane"], key)
+
+    def send_ctrl_c(self, target):
+        self._send_key(target, "ctrl+c")
+
+    def send_esc(self, target):
+        # Codex opens an unclosable "Task is still running" modal on Ctrl+C while working;
+        # Esc dismisses that modal or interrupts the active turn back to idle.
+        self._send_key(target, "esc")
 
 
 def locate_in_band(service, clients):
@@ -117,10 +131,10 @@ def locate_in_band(service, clients):
 def exit_in_band(clients, timeout, changed=lambda: None):
     """Quit TUIs from their own input so they restore their terminals. Never signals them.
 
-    Ctrl+C goes to every pending pane each round, so several sessions close in
-    parallel. Ctrl+C interrupts a running turn or clears a draft, and a repeated
-    Ctrl+C quits. It is the only key sent; its effect on an approval overlay is
-    expected to be rejection but is not yet observed.
+    Keys go to every pending pane each round, so several sessions close in parallel.
+    While Herdr reports an active working turn, Esc interrupts the turn (or
+    dismisses an open running-task modal first); otherwise Ctrl+C clears any draft,
+    backs out of trust/approval overlays without confirming, and quits cleanly.
     """
     herdr = Herdr()
     deadline = time.monotonic() + timeout
@@ -140,6 +154,7 @@ def exit_in_band(clients, timeout, changed=lambda: None):
 
     pending = settle(clients)
     while pending and time.monotonic() < deadline:
+        round_statuses = {}
         for client in pending:
             if not alive(client):
                 continue
@@ -149,8 +164,30 @@ def exit_in_band(clients, timeout, changed=lambda: None):
                 continue
             if client["pid"] not in foreground:
                 accounts.refuse("pane/process ownership changed; no keys sent")
+            session = client["session"]
+            if session not in round_statuses:
+                round_statuses[session] = herdr.pane_statuses(session)
+            if not alive(client):
+                continue
             client["key_delivery"] = "unconfirmed"
-            herdr.send_ctrl_c(client)
+            try:
+                if round_statuses[session].get(client["pane"]) == "working":
+                    herdr.send_esc(client)
+                else:
+                    herdr.send_ctrl_c(client)
+            except accounts.Refused:
+                # Herdr releases the agent handle as the CLI exits (agent_not_found), which can
+                # reject an in-flight key slightly before /proc reaps the PID.
+                drain = min(deadline, time.monotonic() + KEY_INTERVAL)
+                while alive(client) and time.monotonic() < drain:
+                    time.sleep(.02)
+                if alive(client):
+                    raise
+                if client.get("keys_sent", 0):
+                    client["key_delivery"] = "acknowledged"
+                else:
+                    client.pop("key_delivery", None)
+                continue
             client["key_delivery"] = "acknowledged"
             client["keys_sent"] = client.get("keys_sent", 0) + 1
         pause = time.monotonic() + KEY_INTERVAL
@@ -158,7 +195,7 @@ def exit_in_band(clients, timeout, changed=lambda: None):
             time.sleep(.05)
         pending = settle(pending)
     if pending:
-        accounts.refuse("CLI did not quit after Ctrl+C; no signal sent and no new CLI started")
+        accounts.refuse("CLI did not quit after Esc/Ctrl+C; no signal sent and no new CLI started")
     for client in clients:
         while client["pid"] in herdr.foreground(client["session"], client["pane"]):
             if time.monotonic() >= deadline:

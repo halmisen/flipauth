@@ -31,10 +31,7 @@
 
 ## 当前闭环
 
-2026-11-13 实机切换暴露旧终端收尾缺陷，隔离原生 PTY 已复现 OS 信号退出后模式泄漏。
-用户指定交接 Claude；本机私有入口：[terminal-exit-handoff.local.md](terminal-exit-handoff.local.md)。
-源码已修（Codex 经 Herdr 按键退出、仅换账号时清场），真实已登录会话往返验收待用户完成；
-不要据离线通过宣告实机验收完成。
+2026-11-13 实机切换暴露旧终端收尾缺陷，隔离原生 PTY 已复现 OS 信号退出后模式泄漏；后续又在 `halmi-home` 真机实测并修复三处源码缺陷（npm `process.execve` 路径漏检、`working` 回合 `Task is still running` 弹窗卡死、`agent send-keys` 与 CLI 退出瞬间撞车），Codex 全场景真机已闭环通过（详情与回执见 [terminal-switch.md](terminal-switch.md) 与 [KANBAN.md](../../KANBAN.md)）。
+仍待补测：Claude 多账号切换（`halmi-home` 目前仅配置单账号），以及 `workman` 端同步拉取复验。
 
 以当前恢复入口的验证记录为准。此前 58 场景对应旧重构，不代表此次终端切换合同。
-命名入口部署只验证可发现和内容；真实身份、刷新及切换仍待用户实机验收。

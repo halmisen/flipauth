@@ -84,13 +84,18 @@ before termination. No detached switch worker or old-pane relaunch is used.
 
 Codex restores its terminal (raw mode, alternate screen, focus/paste/mouse reporting)
 only when it quits from its own keyboard input; every external signal leaves those
-modes enabled in the old terminal. Close Codex CLIs only by Ctrl+C sent through
-Herdr's `agent send-keys` (rejected once the agent no longer holds the pane), re-checking
-PID birth after each pane-foreground query and right before each key,
-until the PID is gone and the pane foreground no longer holds it. A Codex CLI not in
+modes enabled in the old terminal. Close Codex CLIs in-band through Herdr's `agent send-keys`
+(rejected once the agent no longer holds the pane), re-checking PID birth after each
+pane-foreground query and right before each key, until the PID is gone and the pane
+foreground no longer holds it: send `Esc` while Herdr reports `agent_status == "working"`
+(interrupting active turns or dismissing the `"Task is still running"` modal, which
+ignores subsequent `Ctrl+C`s), and send `Ctrl+C` otherwise (observed to cancel trust
+and command-approval overlays cleanly without confirming). If `agent send-keys` rejects
+right as the CLI exits, wait briefly (within the stop deadline) to confirm process exit
+rather than aborting with a false failure; refuse if it stays alive. A Codex CLI not in
 exactly one Herdr pane refuses during preflight. Never signal a Codex CLI, never write
-another process's PTY directly, and send no key other than Ctrl+C (its effect on an
-approval overlay is unobserved). A headless Codex outside any pane also refuses.
+another process's PTY directly, and never send confirming keys (`Enter`/`y`/digits). A
+headless Codex outside any pane also refuses.
 Claude restores its terminal on SIGTERM: terminate exact Claude CLI births through
 pidfd SIGTERM, then wait for exit. Recheck this per-service split after a major CLI
 upgrade with `work/directory-launcher/native-terminal-probe.py`. Stop verified

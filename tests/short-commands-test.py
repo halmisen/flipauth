@@ -113,13 +113,22 @@ if service == 'claude':
 def keys():
     if not select.select([0],[],[],.02)[0]: return
     for byte in os.read(0, 64):
-        if byte != 3: continue
+        if byte not in (3, 27): continue
         with state() as data:
             row = data['panes'][pane]
-            data['events'].append(['ctrl+c',pane,row['status']])
             if data.get('stubborn') or row.get('stubborn'): continue
+            if byte == 27:
+                data['events'].append(['esc',pane,row['status']])
+                if row['status'] == 'task_modal':
+                    row['status'] = 'working'
+                elif row['status'] == 'working':
+                    row['status'] = 'idle'
+                continue
+            data['events'].append(['ctrl+c',pane,row['status']])
             if row['status'] == 'working':
-                row['status'] = 'idle'; continue
+                row['status'] = 'task_modal'; continue
+            if row['status'] == 'task_modal':
+                continue
         finish('ctrl+c')
 (directory/('ready-'+pane)).touch()
 if os.environ.get('FX_SWITCH_ON_START') and directory.name == '.codex':
@@ -164,7 +173,10 @@ with state() as data:
     if args == ['session', 'list', '--json']:
         print(json.dumps({'sessions': [{'name': 'fx', 'running': True}]}))
     elif args == ['api', 'snapshot']:
-        print(json.dumps({'result': {'snapshot': {'panes': [{'pane_id': p} for p in panes]}}}))
+        print(json.dumps({'result': {'snapshot': {'panes': [
+            {'pane_id': p, 'agent_status': 'working' if panes[p].get('status') in {'working', 'task_modal'} else 'idle'}
+            for p in panes
+        ]}}}))
     elif args[:3] == ['pane', 'process-info', '--pane'] and args[3] in panes:
         row = panes[args[3]]
         live = row.get('pid') and alive(row['pid'])
@@ -181,7 +193,7 @@ with state() as data:
         sys.exit(2)
 '''
 
-KEYS = {'ctrl+c': b'\x03'}
+KEYS = {'ctrl+c': b'\x03', 'esc': b'\x1b'}
 MODE = re.compile(rb'\x1b\[\?([0-9]+)([hl])')
 
 
@@ -645,6 +657,95 @@ class ShortCommands(unittest.TestCase):
         events=self.state()['events']
         self.assertGreaterEqual(admitted,1)
         self.assertEqual(len([e for e in events if e[:2]==['invoked',str(first)]]),admitted)
+
+    def test_working_codex_interrupts_with_esc_and_recovers_from_task_modal(self):
+        first,second=self.setup_accounts()
+        working_pane=self.start('w','codex',first)
+        modal_pane=self.start('m','codex',first)
+        with self.locked_state() as data:
+            data['panes']['m']['status']='task_modal'
+        saved=self.env['FLIPAUTH_SWITCH_STOP_TIMEOUT']
+        self.env['FLIPAUTH_SWITCH_STOP_TIMEOUT']='5'
+        try:
+            self.short('cod','secondary')
+        finally:
+            self.env['FLIPAUTH_SWITCH_STOP_TIMEOUT']=saved
+        self.assertEqual(working_pane.wait(timeout=3),0)
+        self.assertEqual(modal_pane.wait(timeout=3),0)
+        self.assert_terminal_restored('w')
+        self.assert_terminal_restored('m')
+        events=self.state()['events']
+        self.assertIn(['esc','w','working'],events)
+        self.assertNotIn(['ctrl+c','w','working'],events)
+        self.assertIn(['esc','m','task_modal'],events)
+        self.assertIn(['esc','m','working'],events)
+        self.assertIn(['exited','w','ctrl+c'],events)
+        self.assertIn(['exited','m','ctrl+c'],events)
+        self.assertEqual(self.record(second)['home'],str(second))
+
+    def test_non_working_status_keeps_ctrl_c_only(self):
+        client={'pid':202,'start':5,'session':'fx','pane':'p','state':'planned'}
+        births=iter([5,5,5,5,None])
+        with mock.patch.object(lifecycle,'identity',side_effect=lambda pid: next(births,None)), \
+                mock.patch.object(lifecycle.Herdr,'foreground',side_effect=[{202},set()]), \
+                mock.patch.object(lifecycle.Herdr,'pane_statuses',return_value={'p':'blocked'}), \
+                mock.patch.object(lifecycle.Herdr,'send_esc') as sent_esc, \
+                mock.patch.object(lifecycle.Herdr,'send_ctrl_c') as sent_ctrl_c:
+            lifecycle.exit_in_band([client],1)
+        sent_esc.assert_not_called()
+        sent_ctrl_c.assert_called_once_with(client)
+        self.assertEqual(client['state'],'exited')
+
+    def test_send_key_rejection_after_cli_exit_finishes_cleanly(self):
+        client={'pid':203,'start':5,'session':'fx','pane':'p','state':'planned'}
+        rejected=False
+        draining=0
+        def fake_identity(pid):
+            nonlocal draining
+            if not rejected: return 5
+            draining += 1
+            return 5 if draining <= 2 else None
+        def fake_send(target):
+            nonlocal rejected
+            if not rejected and client.get('keys_sent',0) == 0:
+                return
+            rejected=True
+            raise accounts.Refused('Herdr command failed; inspect receipt before retrying')
+        with mock.patch.object(lifecycle,'identity',side_effect=fake_identity), \
+                mock.patch.object(lifecycle.Herdr,'foreground',side_effect=[{203},{203},set()]), \
+                mock.patch.object(lifecycle.Herdr,'pane_statuses',return_value={'p':'idle'}), \
+                mock.patch.object(lifecycle.Herdr,'send_ctrl_c',side_effect=fake_send):
+            lifecycle.exit_in_band([client],2)
+        self.assertEqual(client['state'],'exited')
+        self.assertEqual(client['keys_sent'],1)
+        self.assertEqual(client['key_delivery'],'acknowledged')
+
+    def test_send_key_rejection_before_first_key_clears_unconfirmed(self):
+        client={'pid':204,'start':5,'session':'fx','pane':'p','state':'planned'}
+        births=[5,5,5,5,None]
+        def fake_identity(pid):
+            return births.pop(0) if births else None
+        with mock.patch.object(lifecycle,'identity',side_effect=fake_identity), \
+                mock.patch.object(lifecycle.Herdr,'foreground',side_effect=[{204},set()]), \
+                mock.patch.object(lifecycle.Herdr,'pane_statuses',return_value={'p':'idle'}), \
+                mock.patch.object(lifecycle.Herdr,'send_ctrl_c',
+                                  side_effect=accounts.Refused('Herdr command failed; inspect receipt before retrying')):
+            lifecycle.exit_in_band([client],1)
+        self.assertEqual(client['state'],'exited')
+        self.assertNotIn('key_delivery',client)
+        self.assertEqual(client.get('keys_sent',0),0)
+
+    def test_send_key_rejection_while_cli_remains_alive_refuses(self):
+        client={'pid':205,'start':5,'session':'fx','pane':'p','state':'planned'}
+        with mock.patch.object(lifecycle,'identity',return_value=5), \
+                mock.patch.object(lifecycle.Herdr,'foreground',return_value={205}), \
+                mock.patch.object(lifecycle.Herdr,'pane_statuses',return_value={'p':'idle'}), \
+                mock.patch.object(lifecycle.Herdr,'send_ctrl_c',
+                                  side_effect=accounts.Refused('Herdr command failed; inspect receipt before retrying')):
+            with self.assertRaisesRegex(accounts.Refused,'Herdr command failed'):
+                lifecycle.exit_in_band([client],.2)
+        self.assertEqual(client['state'],'planned')
+        self.assertEqual(client['key_delivery'],'unconfirmed')
 
 
 if __name__=='__main__': unittest.main(verbosity=2)
