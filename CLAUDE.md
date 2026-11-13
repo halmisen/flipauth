@@ -14,3 +14,5 @@ This file is the Claude-side overlay and is deliberately empty of rules. Add one
 here only when it genuinely differs for Claude Code; a rule that would apply to
 any agent belongs in `AGENTS.md`, and duplicating architecture here would only
 create two copies that drift apart.
+
+@AGENTS.md
