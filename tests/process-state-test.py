@@ -240,6 +240,36 @@ class ProcFixture(unittest.TestCase):
         }
         self.assertEqual(process_state.daemon_stop_order({10, 20}, facts), [20, 10])
 
+    def test_npm_codex_execve_vendor_binary_is_observed_while_helpers_are_ignored(self):
+        nvm_versions = self.root / "nvm/versions/node"
+        active_bin = nvm_versions / "v24.22.3/bin/codex"
+        active_js = nvm_versions / "v24.22.3/lib/node_modules/@openai/codex/bin/codex.js"
+        active_bin.parent.mkdir(parents=True)
+        active_js.parent.mkdir(parents=True)
+        active_js.write_text("#!/usr/bin/env node\n")
+        active_js.chmod(0o700)
+        os.symlink("../lib/node_modules/@openai/codex/bin/codex.js", active_bin)
+        os.environ["FLIPAUTH_CODEX_BIN"] = str(active_bin)
+
+        nested_cli = (nvm_versions / "v24.22.3/lib/node_modules/@openai/codex/node_modules/"
+                      "@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex")
+        hoisted_cli = (nvm_versions / "v24.22.3/lib/node_modules/@openai/codex-linux-x64/"
+                       "vendor/x86_64-unknown-linux-musl/bin/codex")
+        older_cli = (nvm_versions / "v24.21.0/lib/node_modules/@openai/codex/node_modules/"
+                     "@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex")
+        helper = nested_cli.with_name("codex-code-mode-host")
+        voice_helper = nested_cli.parent.parent / "codex-resources/voice/bin/codex"
+        for binary in (nested_cli, hoisted_cli, older_cli, helper, voice_helper):
+            binary.parent.mkdir(parents=True, exist_ok=True)
+            binary.write_text("fake")
+            binary.chmod(0o700)
+
+        for offset, binary in enumerate((nested_cli, hoisted_cli, older_cli, helper, voice_helper), start=1):
+            self.add_proc([str(binary)], {"HOME": str(self.root / "home")}, pid=5000 + offset, exe=binary)
+        self.ps.write_text("#!/bin/sh\nprintf '%s\\n' 5001 5002 5003 5004 5005\n")
+        facts = process_state.processes("codex")
+        self.assertEqual(set(facts), {5001, 5002, 5003})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

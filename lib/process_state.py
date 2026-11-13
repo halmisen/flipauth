@@ -96,6 +96,55 @@ def _exe(pid):
         return None
 
 
+def _codex_npm_vendors(target):
+    """Return vendor directories belonging to an npm-installed @openai/codex package."""
+    if target.parent.name != "bin":
+        return set()
+    package_root = target.parent.parent
+    if package_root.name != "codex" or package_root.parent.name != "@openai":
+        return set()
+    vendors = [package_root / "vendor"]
+    scopes = [package_root.parent]
+    nested_scope = package_root / "node_modules" / "@openai"
+    if nested_scope.is_dir():
+        scopes.append(nested_scope)
+    # Include sibling nvm Node versions so switching/upgrading Node does not hide running CLIs.
+    node_modules = package_root.parent.parent
+    node_root = node_modules.parent.parent if node_modules.name == "node_modules" and node_modules.parent.name == "lib" else None
+    if node_root and node_root.parent.name == "node" and node_root.parent.parent.name == "versions":
+        try:
+            for sibling in node_root.parent.iterdir():
+                candidate = sibling / "lib" / "node_modules" / "@openai"
+                if candidate.is_dir():
+                    scopes.append(candidate)
+        except OSError:
+            pass
+    for scope in scopes:
+        try:
+            entries = list(scope.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name == "codex" or entry.name.startswith("codex-"):
+                vendors.append(entry / "vendor")
+                nested = entry / "node_modules" / "@openai"
+                if nested.is_dir():
+                    try:
+                        for sub in nested.iterdir():
+                            if sub.name == "codex" or sub.name.startswith("codex-"):
+                                vendors.append(sub / "vendor")
+                    except OSError:
+                        pass
+    resolved = set()
+    for path in vendors:
+        if path.is_dir():
+            try:
+                resolved.add(path.resolve())
+            except OSError:
+                continue
+    return resolved
+
+
 def _official_signatures(service):
     """Return exact executable paths and trusted installation families."""
     # Use the same resolver as launch. It consults registered executables and
@@ -108,6 +157,7 @@ def _official_signatures(service):
         accounts.refuse("cannot resolve official CLI for process ownership")
     exact = set()
     families = set()
+    vendor_families = set()
     for path in paths:
         try:
             target = path.resolve()
@@ -120,12 +170,14 @@ def _official_signatures(service):
         # running older version remains official after the symlink advances.
         if service == "claude" and target.parent.name == "versions":
             families.add(target.parent)
-        # Codex standalone releases share a stable ``releases`` directory.
+        # Codex standalone releases share a stable ``releases`` directory;
+        # npm @openai/codex replaces Node via execve with vendor/<triple>/bin/codex.
         if service == "codex":
             for parent in target.parents:
                 if parent.name == "releases":
                     families.add(parent)
                     break
+            vendor_families.update(_codex_npm_vendors(target))
     if service == "codex":
         registry = accounts.load_registry(registry_root())
         homes = {Path.home() / ".codex"}
@@ -133,10 +185,10 @@ def _official_signatures(service):
         for home in homes:
             for package in ("standalone", "app-server-daemon"):
                 families.add((home / "packages" / package / "releases").resolve())
-    return exact, families
+    return exact, families, vendor_families
 
 
-def _is_service_process(service, argv, exe, exact, families):
+def _is_service_process(service, argv, exe, exact, families, vendor_families):
     if exe and exe in exact:
         return True
     if exe and any(parent in families for parent in exe.parents):
@@ -145,6 +197,13 @@ def _is_service_process(service, argv, exe, exact, families):
         # number as its actual filename.
         if exe.name == service or (service == "claude" and
                 re.fullmatch(r"\d+\.\d+\.\d+(?:[-+].*)?", exe.name)):
+            return True
+    if service == "codex" and exe and exe.name == "codex" and exe.parent.name == "bin":
+        try:
+            vendor_root = exe.parent.parent.parent.resolve()
+        except OSError:
+            vendor_root = None
+        if vendor_root in vendor_families:
             return True
     # A shebang launcher reports the interpreter as argv0. Only accept its
     # first script argument when that exact script is the configured official
@@ -215,7 +274,7 @@ def process_fact(pid, service, signatures=None):
         return None
     if final_start != start:
         accounts.refuse("process changed during inspection; no switch performed")
-    exact, _ = signatures
+    exact = signatures[0]
     return {
         "pid": int(pid),
         "start": start,

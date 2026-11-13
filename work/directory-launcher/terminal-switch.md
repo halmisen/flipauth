@@ -108,3 +108,9 @@ Codex 旧 pane 的 Ctrl+C 改为每轮发给全部待退出 pane。验证：新�
 - P3 直通误判：标志扫描止于官方 `--`，其后视为提示词原文。
 - P4 文档：`--switch` 帮助与 card.md 当前闭环已更新。
 - 回归：3 项新用例在修复前代码上全部失败，修复后离线 7 套零失败（切换 25）。日志：`terminal-exit-verification.txt`。
+
+## halmi-home 实机热切换验证与 npm `execve` 修复（2026-11-13 晚）
+
+- 首次在 `halmi-home`（npm `@openai/codex 0.169.0` + Node `v24.22.3`）热切换时，因 `codex.js` 调用 `process.execve` 原地替换为 `.../@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`，原 `_official_signatures("codex")` 仅覆盖 `codex.js` 与 `releases/`，导致运行中的 CLI 未被识别（`stopped_cli: []`）。
+- 修复：`lib/process_state.py` 新增 `_codex_npm_vendors()`，识别嵌套、提升、自带及同 `nvm` 版本族下的 `@openai/codex*/vendor/<triple>/bin/codex`，并保持排除 `codex-code-mode-host` 与嵌套资源子目录；`tests/process-state-test.py` 补全回归测试（先红后绿），完整 7 套测试通过。
+- 实机结果：在 Herdr `wJ:pP` 与 `wJ:pN` 之间完成两次已登录热切换（`sen` → `az` → `sen`，回执 `codex-a30b556e3ef2489696016467bfa697a7.json` 与 `codex-fe658206a6a14bce99a6321aab4d45d6.json`），均经 `herdr agent send-keys ctrl+c` 退出旧 CLI（`key_delivery: acknowledged`）、旧终端退回 shell、旧 daemon 全停、新账号启动与 `launch_observed: true` 验证通过。仍待验证：Codex 忙碌输出中或审批弹窗时的 Ctrl+C、Claude 多账号切换，以及 `workman` 拉取本提交后的复验。

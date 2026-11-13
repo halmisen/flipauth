@@ -41,8 +41,7 @@
 
 ## 实机验收
 
-2026-11-13 用户实机试切后报告旧终端残留界面并刷控制序列，随后已切回原账号。
-根因：Codex 0.167.2 对任何外部信号都不恢复终端，只有键盘内退出会恢复；Claude 收 SIGTERM 会恢复。
-2026-11-13 Claude 已在源码改为 Codex 经 Herdr Ctrl+C 退出，终端状态回归先红后绿，
-一次性 Herdr pane 内未登录 Codex 实测通过（`terminal-switch.md`）；
-真实已登录会话切换（旧终端可输入、鼠标不出字、新终端单一目标账号、daemon 自动出现）仍待用户现场执行。
+2026-11-13 用户在 `workman` 实机试切后报告旧终端残留界面并刷控制序列，随后切回原账号；根因为 Codex 对外部信号不恢复终端，Claude 收 SIGTERM 会恢复。同日 Claude 在 `d7806f4` 改为 Codex 经 Herdr Ctrl+C 退出。
+2026-11-13 晚在 `halmi-home`（npm `@openai/codex 0.169.0` + Node `v24.22.3`）首次真机热切换实测时，发现 `codex.js` 调用 `process.execve` 替换成 `vendor/<triple>/bin/codex`，原进程识别漏掉该路径导致旧 CLI 未收到 Ctrl+C；已在 `lib/process_state.py` 新增 `_codex_npm_vendors` 与回归测试并复验通过。
+随后实机连续完成两次已登录会话热切换（`codex-sen` → `codex-az` → `codex-sen`，跨 `wJ:pP` / `wJ:pN`）：两次旧 CLI 均经 `herdr agent send-keys ctrl+c` 退出（`key_delivery: acknowledged`），旧终端干净退回 shell，旧 `app-server` 守护进程全部退出，新账号 CLI 与自动守护进程均被 `status` 观测到（`launch_observed: true`）。
+仍未实测：Codex 处于思考/工具调用或审批弹窗中切换、已登录 Claude 多账号切换，以及 `workman` 拉取本修复后的复验。
