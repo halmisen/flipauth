@@ -2,6 +2,16 @@
 
 > 唯一短状态面板。长任务恢复入口：[card.md](work/directory-launcher/card.md)。
 
+## 持续维护标准
+
+2026-11-13 用户明确后续判断标准：
+
+> This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it.
+
+负责本项目的代理按长期维护者的立场工作，主动判断项目用途、设计、实现与演进方式。
+每次改动都要考虑实际使用价值、整体逻辑和后续继续开发的成本。
+用户明确的需求与操作授权边界继续适用。
+
 ## 当前方向与授权
 
 2026-11-13 用户修正切换语义：带账号名的切换入口关闭同服务全部旧 CLI，
