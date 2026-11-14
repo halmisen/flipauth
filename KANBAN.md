@@ -17,13 +17,15 @@
 2026-11-13 用户修正切换语义：带账号名的切换入口关闭同服务全部旧 CLI，
 再停止旧 Codex daemon，只在输入命令的新终端及其工作目录启动一个新会话。
 2026-11-13 再修正：只在有其他账号的 CLI/daemon 时才清场；同账号或无进程时直接再开一个，
-不停 daemon；`exec`/`login`/`--version` 等非交互子命令直通不切换。用户日常只用命名切换入口（如 `codex-<name>`），
-普通 `codex` 保持官方入口。旧终端回到 shell。新 daemon 由官方 CLI 自动拉起，不显式启动。
+不停 daemon；`exec`/`login`/`--version` 等非交互子命令直通不切换。用户日常切号用命名切换入口（如 `codex-<name>`）；
+2026-11-15 用户确认：为避免 `codex-az` 期间多 Agent / Herdr 按默认习惯执行裸 `codex` 落回 `~/.codex`（`sen`）导致混号清场，
+已在 `halmi-home` 部署 `bind-current` 到 `~/.local/bin/codex`，使普通 `codex` 经 `account current` 跟随 `selected`（不清场）；
+未部署 `bind-current` 的环境（如 `workman` 尚未部署前）或直接调用原官方二进制时，普通入口仍不随选择变化。旧终端回到 shell。新 daemon 由官方 CLI 自动拉起，不显式启动。
 用户已授权代码、部署脚本及命名入口部署；本轮不实际停止会话、登录或迁移凭据。
 账号目录固定，官方 CLI 独占登录、刷新和请求；无网关、配额轮询或自动轮换。
 2026-11-13 用户定界：额度只做 L0 显示（Claude statusLine 的 `rate_limits`、Codex 内置 `status_line`），
 不做提醒、预选、自动切换、凭据读取或额度请求；切换只由用户在协作间隙手动执行。
-默认记录、后续选择、实际进程与服务端身份分别核验；普通官方入口不随选择变化。
+默认记录、后续选择、实际进程与服务端身份分别核验；直接调用原官方入口不随选择变化（已部署 `bind-current` 的 PATH 包装器除外）。
 
 ## 当前实现与恢复
 

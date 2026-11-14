@@ -59,7 +59,10 @@ OAuth without an API key uses state outside the config home and is unsupported.
   and flags (`exec`, `login`, `mcp`, `--version`, Claude `-p`, ...; first argument
   only for subcommands) run in the named home without switching or selecting.
   A switch needs a TTY; invoking a switch from inside a CLI is refused.
-  Plain `codex` stays the official entry and is not a switch.
+  Plain `codex` is not a switch; without `bind-current` on PATH it runs the official
+  default home directly, and with `bind-current` installed on PATH (for example
+  `~/.local/bin/codex`) it follows `selected` via `account current` without
+  stopping peers.
   No cross-account conversation resume or relaunch in old panes.
 - Bindings use one generator and one official executable resolver. PATH discovery
   skips FlipAuth wrappers; binding records the stable official entry in the registry.
