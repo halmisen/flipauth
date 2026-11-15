@@ -270,6 +270,33 @@ class ProcFixture(unittest.TestCase):
         facts = process_state.processes("codex")
         self.assertEqual(set(facts), {5001, 5002, 5003})
 
+    def test_versioned_python_and_dash_wrappers_strip_interpreter_from_command(self):
+        script = self.root / "bin" / "codex-entry"
+        script.write_text("#!/usr/bin/env python3.12\n")
+        script.chmod(0o700)
+        os.environ["FLIPAUTH_CODEX_BIN"] = str(script)
+        py_interp = self.root / "bin" / "python3.12"
+        dash_interp = self.root / "bin" / "dash"
+        for interp in (py_interp, dash_interp):
+            interp.write_text("fake interp")
+            interp.chmod(0o700)
+        self.add_proc(
+            [str(py_interp), str(script), "app-server", "--managed-daemon"],
+            {"HOME": str(self.root / "home")},
+            pid=6001,
+            exe=py_interp,
+        )
+        self.add_proc(
+            [str(dash_interp), str(script), "exec", "--help"],
+            {"HOME": str(self.root / "home")},
+            pid=6002,
+            exe=dash_interp,
+        )
+        self.ps.write_text("#!/bin/sh\nprintf '%s\\n' 6001 6002\n")
+        facts = process_state.processes("codex")
+        self.assertEqual(facts[6001]["command"], ["app-server", "--managed-daemon"])
+        self.assertEqual(facts[6002]["command"], ["exec", "--help"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

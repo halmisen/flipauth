@@ -188,6 +188,9 @@ def _official_signatures(service):
     return exact, families, vendor_families
 
 
+_INTERPRETER_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?|node|bun|bash|dash|sh|zsh")
+
+
 def _is_service_process(service, argv, exe, exact, families, vendor_families):
     if exe and exe in exact:
         return True
@@ -208,7 +211,7 @@ def _is_service_process(service, argv, exe, exact, families, vendor_families):
     # A shebang launcher reports the interpreter as argv0. Only accept its
     # first script argument when that exact script is the configured official
     # entry; arbitrary prompt/argument text is never a service signal.
-    interpreter = exe and re.fullmatch(r"python(?:\d+(?:\.\d+)*)?|node|bun|bash|dash|sh|zsh", exe.name)
+    interpreter = exe and _INTERPRETER_RE.fullmatch(exe.name)
     if interpreter and len(argv) > 1:
         try:
             script = Path(argv[1]).resolve()
@@ -224,8 +227,7 @@ def _command_args(argv, exact):
     if not argv:
         return []
     first = Path(argv[0]).name
-    interpreters = {"python", "python3", "node", "bun", "bash", "sh", "zsh"}
-    if first in interpreters and len(argv) > 1:
+    if _INTERPRETER_RE.fullmatch(first) and len(argv) > 1:
         try:
             if Path(argv[1]).resolve() in exact:
                 return argv[2:]
