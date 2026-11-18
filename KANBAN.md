@@ -21,6 +21,7 @@
 2026-11-15 用户确认：为避免 `codex-az` 期间多 Agent / Herdr 按默认习惯执行裸 `codex` 落回 `~/.codex`（`sen`）导致混号清场，
 已在 `halmi-home` 部署 `bind-current` 到 `~/.local/bin/codex`，使普通 `codex` 经 `account current` 跟随 `selected`（不清场）；
 未部署 `bind-current` 的环境（如 `workman` 尚未部署前）或直接调用原官方二进制时，普通入口仍不随选择变化。旧终端回到 shell。新 daemon 由官方 CLI 自动拉起，不显式启动。
+2026-11-18 用户确认普通 `claude` 也跟随 `selected`。`workman` 已通过 `~/.local/flipauth/bin/claude` 部署 `bind-current`，新 Bash 优先使用该目录。当前只登记 `fiver`，并将它设为当前选择，初始默认仍留空，`claude-fiver` 保留固定入口。
 用户已授权代码、部署脚本及命名入口部署；本轮不实际停止会话、登录或迁移凭据。
 账号目录固定，官方 CLI 独占登录、刷新和请求；无网关、配额轮询或自动轮换。
 2026-11-13 用户定界：额度只做 L0 显示（Claude statusLine 的 `rate_limits`、Codex 内置 `status_line`），
