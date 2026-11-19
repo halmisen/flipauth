@@ -408,6 +408,11 @@ def bind(service, script, root, data, args):
 def bind_launcher(service, script, root, value, label=None, switch=False, check=False):
     target_input = Path(value).expanduser()
     if target_input.is_symlink():
+        if label is None:
+            refuse(
+                f"cannot place bind-current wrapper at symlink {target_input}; "
+                f"use a separate PATH directory ahead of it, such as ~/.local/flipauth/bin/{service}"
+            )
         refuse("launcher target is a symlink; nothing replaced")
     target = local_path(value)
     try:
@@ -424,6 +429,26 @@ def bind_launcher(service, script, root, value, label=None, switch=False, check=
     binary = cli_binary(service, script)
     if target == binary or target.resolve() == binary.resolve():
         refuse("cannot replace the official executable; choose a separate PATH directory")
+    if label is None:
+        forbidden_dirs = {binary.parent.resolve(), binary.resolve().parent}
+        for folder in os.get_exec_path():
+            candidate = Path(folder or ".") / service
+            if candidate.is_symlink() or (candidate.is_file() and os.access(candidate, os.X_OK)):
+                try:
+                    resolved_cand = candidate.resolve()
+                    with resolved_cand.open("rb") as source:
+                        if b"# flipauth " in source.read(256):
+                            continue
+                    forbidden_dirs.add(candidate.parent.resolve())
+                    forbidden_dirs.add(resolved_cand.parent)
+                except OSError:
+                    continue
+        if target.parent in forbidden_dirs:
+            refuse(
+                f"refusing to place bind-current wrapper in official {service} directory "
+                f"({target.parent}); official upgrades can overwrite it. "
+                f"Use a separate PATH directory ahead of it, such as ~/.local/flipauth/bin/{service}"
+            )
     if switch:
         words = [str(script), service, label]
         marker = "switch"
@@ -457,6 +482,69 @@ def bind_launcher(service, script, root, value, label=None, switch=False, check=
     print(f"{'already bound' if existed else 'bound'}: {target}")
 
 
+def migrate_default(service, root, args):
+    """Move a registered default-home account to a dedicated directory for Fail-Closed isolation.
+
+    For Codex, ``packages/`` stays in ``~/.codex`` so standalone symlinks
+    (``~/.local/bin/codex`` and ``~/.codex/packages/standalone/current``) remain intact.
+    Refuses if any same-service process is running in the default home.
+    Never reads credential contents.
+    """
+    from process_state import processes
+    default_home = (Path.home() / ("." + service)).resolve()
+    new_dir = local_path(args.directory)
+    if new_dir.exists() or new_dir.is_symlink():
+        refuse(f"target directory already exists: {new_dir}; nothing moved")
+    if not new_dir.parent.is_dir():
+        refuse(f"parent directory does not exist: {new_dir.parent}; nothing moved")
+    if overlaps(root, new_dir):
+        refuse("account and registry directories must not overlap")
+    for owner in ("claude", "codex"):
+        if overlaps((Path.home() / ("." + owner)).resolve(), new_dir):
+            refuse("target directory overlaps a default CLI home")
+    with service_lock(root, service + "-operation", exclusive=True), service_lock(root, service, exclusive=True):
+        with registry_writer(root) as data:
+            entry, directory = account(data, service, args.name)
+            if directory != default_home:
+                refuse(f"account {args.name} is not in the default home ({default_home}); "
+                       f"currently at {directory}")
+            if not default_home.is_dir():
+                refuse(f"default home missing: {default_home}")
+            for group in data["accounts"].values():
+                if any(overlaps(Path(row["directory"]), new_dir) for row in group.values()):
+                    refuse("target directory overlaps an already-registered account")
+            if default_home.stat().st_dev != new_dir.parent.stat().st_dev:
+                refuse("target directory must be on the same filesystem as the default home for atomic migration")
+            running = processes(service)
+            busy = [
+                f"pid={pid} role={'app-server' if 'app-server' in fact['argv'] else 'cli'}"
+                for pid, fact in sorted(running.items())
+                if Path(fact["home"]).resolve() == default_home
+            ]
+            if busy:
+                refuse(f"cannot migrate {default_home} while {service} processes are using it "
+                       f"({'; '.join(busy)}); stop them first; nothing moved")
+            preserve = {"packages"} if service == "codex" else set()
+            items = sorted(p.name for p in default_home.iterdir())
+            to_move = [item for item in items if item not in preserve]
+            kept = [item for item in items if item in preserve]
+            if args.dry_run:
+                print(f"dry-run: would move {len(to_move)} entries from {default_home} to {new_dir} "
+                      f"(keeping {', '.join(kept) or 'none'} in {default_home}) "
+                      f"and update {service}/{args.name} in registry")
+                return
+            new_dir.mkdir(mode=0o700)
+            for item in to_move:
+                os.rename(default_home / item, new_dir / item)
+            entry["directory"] = str(new_dir)
+            write_registry(root, data)
+    credential = "auth.json" if service == "codex" else ".credentials.json"
+    still_present = (default_home / credential).exists()
+    print(f"migrated {service} {args.name}: {default_home} -> {new_dir} "
+          f"(moved={len(to_move)}, kept_in_default={','.join(kept) or 'none'}, "
+          f"default_{credential}={'present' if still_present else 'absent'})")
+
+
 def main():
     service, executable = sys.argv[1:3]
     parser = argparse.ArgumentParser(prog=f"flipauth {service} account",
@@ -480,18 +568,25 @@ def main():
     p.add_argument("name", type=name)
     p.add_argument("path")
     p.add_argument("--switch", action="store_true",
-                   help="on an account change, close all same-service sessions and daemons first; "
+                   help="on an account change, close other-account sessions and daemons first; "
                         "same account just opens one more")
     p.add_argument("--check", action="store_true", help="read-only launcher drift check")
     p = sub.add_parser("current", help="launch the selected directory; used by the optional CLI wrapper")
     p.add_argument("arguments", nargs=argparse.REMAINDER)
     p = sub.add_parser("bind-current", help="create an optional codex/claude wrapper that follows selection")
     p.add_argument("path")
+    p = sub.add_parser("migrate-default",
+                       help="move a default-home account to a dedicated directory so the default home is Fail-Closed")
+    p.add_argument("name", type=name)
+    p.add_argument("directory")
+    p.add_argument("--dry-run", action="store_true", help="preflight and preview without moving files")
     args = parser.parse_args(sys.argv[3:])
     root = local_path(os.environ.get("FLIPAUTH_ACCOUNTS_DIR", str(Path.home() / ".local/state/flipauth")))
     script = Path(executable).resolve()
     if args.command == "add":
         add(service, root, args)
+    elif args.command == "migrate-default":
+        migrate_default(service, root, args)
     else:
         data = load_registry(root)
         if args.command == "list":

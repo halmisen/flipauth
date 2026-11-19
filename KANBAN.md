@@ -22,6 +22,12 @@
 已在 `halmi-home` 部署 `bind-current` 到 `~/.local/bin/codex`，使普通 `codex` 经 `account current` 跟随 `selected`（不清场）；
 未部署 `bind-current` 的环境（如 `workman` 尚未部署前）或直接调用原官方二进制时，普通入口仍不随选择变化。旧终端回到 shell。新 daemon 由官方 CLI 自动拉起，不显式启动。
 2026-11-18 用户确认普通 `claude` 也跟随 `selected`。`workman` 已通过 `~/.local/flipauth/bin/claude` 部署 `bind-current`，新 Bash 优先使用该目录。当前只登记 `fiver`，并将它设为当前选择，初始默认仍留空，`claude-fiver` 保留固定入口。
+2026-11-19 `workman` 端 Codex 升级 `0.170.0` 曾覆写直接装在 `~/.local/bin/codex` 的旧 `bind-current` 软链位置，导致裸 `codex` 落回 `~/.codex`（`sen`）并与 `az` 混跑，触发 `codex-az` 按规则清场全部会话；已将 `workman` 的 `codex` `bind-current` 迁入独立优先目录 `~/.local/flipauth/bin/codex`（与 `claude` 同目录防升级覆写），并在 `status` 中补齐实时检测 `PATH` 裸入口是否跟随 `selected` 及混号清场提示。
+2026-11-19 落地三项第一性原理修复：
+1) `bind-current` 路径隔离：代码层禁止将 `bind-current` 写入官方二进制所在目录、官方软链所在目录或已存在的官方软链位置，报错引导至独立优先目录（如 `~/.local/flipauth/bin/<service>`）；
+2) 修正混号切换语义：`selected == target` 且场上存在异号进程时默认预检拒绝且不杀任何进程（列出异号 PID/账号/目录，提示用裸命令或 `account run <target>` 加开，或显式传 `--replace` 清场）；执行切换（`selected != target` 或 `--replace`）时仅停非目标账号 CLI 与 daemon（`home != target`），保留已运行的目标账号 CLI 与 daemon（回执记录 `kept_cli`/`kept_daemon`）；
+3) Fail-Closed 迁移准备：新增 `account migrate-default <name> <new-dir> [--dry-run]`（预检默认目录零进程后原子迁出账号文件，Codex 保留 `~/.codex/packages/` 以不断开 standalone 软链，迁后 `~/.codex` 无 `auth.json` 实现 Fail-Closed）；已在隔离临时 `HOME` 对真实 Codex `0.170.0` 实测验证，待实机 `~/.codex` 空闲后由用户手动执行迁出 `sen -> ~/.codex-sen`。
+4) 新增跨机幂等脚本 `scripts/deploy-current.sh [codex|claude|all] [--check]`：一键部署/核验 `~/.local/flipauth/bin/<service>`、`~/.bashrc`/`~/.profile` PATH 优先块，并在确认新包装器成功后把旧 `~/.local/bin/<service>` `# flipauth current launcher` 备份迁至 `~/.local/state/flipauth/launcher-backups/<timestamp>/`（不碰官方二进制/软链），便于 `workman` 与 `halmi-home` 统一核验/迁移。
 用户已授权代码、部署脚本及命名入口部署；本轮不实际停止会话、登录或迁移凭据。
 账号目录固定，官方 CLI 独占登录、刷新和请求；无网关、配额轮询或自动轮换。
 2026-11-13 用户定界：额度只做 L0 显示（Claude statusLine 的 `rate_limits`、Codex 内置 `status_line`），

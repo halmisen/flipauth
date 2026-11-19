@@ -52,17 +52,29 @@ OAuth without an API key uses state outside the config home and is unsupported.
   selection or stop peers. Login is not a switch of an already-running process.
 - `account current` reads the launch preference under the startup gate.
 - `cod NAME` / `cc NAME` (and named launchers such as `codex-primary`) switch only when
-  a same-service CLI or daemon of another home is running: then they stop every
-  verified same-service CLI, including busy ones, and every daemon, before starting
-  one fresh CLI in the requesting terminal and cwd. When only the target home (or
-  nothing) runs, they start one more CLI and stop nothing. Pass-through subcommands
-  and flags (`exec`, `login`, `mcp`, `--version`, Claude `-p`, ...; first argument
-  only for subcommands) run in the named home without switching or selecting.
+  a same-service CLI or daemon of another home is running:
+  - When `selected == NAME` and other-home processes are running (mixed-account state),
+    they refuse in preflight without stopping anything, listing the other-home PIDs/homes
+    and directing the user to plain `<service>` / `account run NAME` to join or `--replace`
+    to clear the other-home sessions.
+  - When `selected != NAME` or `--replace` is passed, they stop only verified non-target
+    CLIs (including busy ones) and non-target daemons (`home != target`), preserving
+    already-running target CLIs and target daemons (`kept_cli`/`kept_daemon` in the receipt),
+    before starting one fresh CLI in the requesting terminal and cwd.
+  - When only the target home (or nothing) runs, they start one more CLI and stop nothing.
+  Pass-through subcommands and flags (`exec`, `login`, `mcp`, `--version`, Claude `-p`, ...;
+  first argument only for subcommands) run in the named home without switching or selecting.
   A switch needs a TTY; invoking a switch from inside a CLI is refused.
   Plain `codex` is not a switch; without `bind-current` on PATH it runs the official
-  default home directly, and with `bind-current` installed on PATH (for example
-  `~/.local/bin/codex`) it follows `selected` via `account current` without
-  stopping peers.
+  default home directly, and with `bind-current` installed on PATH in a separate
+  directory ahead of the official symlink (for example `~/.local/flipauth/bin/codex`)
+  it follows `selected` via `account current` without stopping peers.
+  `bind-current` refuses to write into the official executable's directory or official
+  symlink's directory so provider upgrades cannot overwrite it.
+  `account migrate-default NAME NEW_DIR` safely moves a default-home account to a dedicated
+  directory after verifying zero processes run in the default home, keeping Codex `packages/`
+  in `~/.codex` so standalone symlinks remain valid while leaving `~/.codex` without `auth.json`
+  (Fail-Closed).
   No cross-account conversation resume or relaunch in old panes.
 - Bindings use one generator and one official executable resolver. PATH discovery
   skips FlipAuth wrappers; binding records the stable official entry in the registry.

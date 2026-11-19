@@ -407,6 +407,150 @@ class Accounts(unittest.TestCase):
         self.assertIn("not writable by group", result.stderr)
         self.assertFalse((directory / "called.json").exists())
 
+    def test_bind_current_refuses_official_binary_and_symlink_directories(self):
+        first = self.create("codex", "primary")
+        self.call("codex", "add", "primary", first, "--default")
+        # 1) Same directory as FLIPAUTH_CODEX_BIN (self.bin/codex-official) is refused.
+        result = self.call("codex", "bind-current", self.bin / "codex", ok=False)
+        self.assertIn("~/.local/flipauth/bin/codex", result.stderr)
+
+        # 2) Separate directory with an official symlink on PATH is refused (both as symlink target and dir).
+        native_dir = self.root / "native-bin"
+        native_dir.mkdir()
+        release_dir = self.root / "releases"
+        release_dir.mkdir()
+        real_bin = release_dir / "codex-0.170.0"
+        real_bin.write_text(FAKE)
+        real_bin.chmod(0o700)
+        official_link = native_dir / "codex"
+        official_link.symlink_to(real_bin)
+        env = {**self.env, "PATH": f"{native_dir}:{self.env['PATH']}"}
+        env.pop("FLIPAUTH_CODEX_BIN", None)
+        # Clear cached executable in registry by using a fresh registry root.
+        env["FLIPAUTH_ACCOUNTS_DIR"] = str(self.root / "registry-iso")
+        self.call("codex", "add", "primary", first, "--default", env=env)
+
+        # Target is the official symlink itself.
+        r1 = self.call("codex", "bind-current", official_link, env=env, ok=False)
+        self.assertIn("~/.local/flipauth/bin/codex", r1.stderr)
+        self.assertTrue(official_link.is_symlink())
+
+        # Target is in the resolved release directory.
+        r2 = self.call("codex", "bind-current", release_dir / "codex", env=env, ok=False)
+        self.assertIn("~/.local/flipauth/bin/codex", r2.stderr)
+        self.assertFalse((release_dir / "codex").exists())
+
+        # Target is in a separate directory: allowed and idempotent even when prepended to PATH.
+        wrappers = self.root / "flipauth-bin"
+        wrappers.mkdir()
+        wrapper = wrappers / "codex"
+        self.call("codex", "bind-current", wrapper, env=env)
+        self.assertTrue(wrapper.is_file())
+        env_with_wrapper = {**env, "PATH": f"{wrappers}:{env['PATH']}"}
+        self.call("codex", "bind-current", wrapper, env=env_with_wrapper)
+
+    def test_migrate_default_moves_account_preserves_packages_and_leaves_default_fail_closed(self):
+        default_dir = self.home / ".codex"
+        default_dir.mkdir(mode=0o700)
+        (default_dir / "auth.json").write_text("SECRET-NEVER-READ")
+        (default_dir / "config.toml").write_text('cli_auth_credentials_store = "file"\n')
+        (default_dir / "sessions").mkdir(mode=0o700)
+        (default_dir / "sessions" / "s1.jsonl").write_text("{}\n")
+        pkg_bin = default_dir / "packages" / "standalone" / "current" / "bin"
+        pkg_bin.mkdir(parents=True, mode=0o700)
+        (pkg_bin / "codex").write_text("#!/bin/sh\nexit 0\n")
+        (pkg_bin / "codex").chmod(0o700)
+
+        # Override fake ps to return empty (no processes running).
+        empty_ps = self.root / "empty-ps"
+        empty_ps.write_text("#!/bin/sh\nexit 0\n")
+        empty_ps.chmod(0o700)
+        env = {**self.env, "FLIPAUTH_PS_BIN": str(empty_ps)}
+
+        self.call("codex", "add", "sen", default_dir, "--default", env=env)
+        target_dir = self.home / ".codex-sen"
+
+        # Dry-run leaves everything untouched.
+        dry = self.call("codex", "migrate-default", "sen", target_dir, "--dry-run", env=env)
+        self.assertIn("dry-run:", dry.stdout)
+        self.assertFalse(target_dir.exists())
+        self.assertTrue((default_dir / "auth.json").is_file())
+
+        # Actual migration moves account state, preserves packages/, updates registry, never reads auth.json.
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self.assertIn("default_auth.json=absent", res.stdout)
+        self.assertNotIn("SECRET", res.stdout + res.stderr)
+        self.assertFalse((default_dir / "auth.json").exists())
+        self.assertTrue((default_dir / "packages" / "standalone" / "current" / "bin" / "codex").is_file())
+        self.assertEqual((target_dir / "auth.json").read_text(), "SECRET-NEVER-READ")
+        self.assertTrue((target_dir / "sessions" / "s1.jsonl").is_file())
+        self.assertFalse((target_dir / "packages").exists())
+
+        registry = json.loads((self.root / "registry/accounts.json").read_text())
+        self.assertEqual(registry["accounts"]["codex"]["sen"]["directory"], str(target_dir))
+
+        # Running again fails because sen is no longer in default home.
+        self.call("codex", "migrate-default", "sen", self.home / ".codex-sen2", env=env, ok=False)
+
+    def test_deploy_current_script_installs_checks_and_migrates_legacy_wrapper(self):
+        first = self.create("codex", "primary")
+        self.call("codex", "add", "primary", first, "--default")
+        claude_home = self.create("claude", "main")
+        self.call("claude", "add", "main", claude_home, "--default")
+
+        local_bin = self.home / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        # Legacy bind-current wrapper left in ~/.local/bin/codex (like halmi-home).
+        legacy_codex = local_bin / "codex"
+        legacy_codex.write_text("#!/bin/sh\n# flipauth current launcher v1\nexec true\n")
+        legacy_codex.chmod(0o700)
+        # Real official symlink in ~/.local/bin/claude must never be moved or deleted.
+        official_claude = local_bin / "claude"
+        official_claude.symlink_to(self.bin / "claude-official")
+
+        (self.home / ".bashrc").write_text("# existing bashrc\n")
+        (self.home / ".profile").write_text("# existing profile\n")
+
+        empty_ps = self.root / "empty-ps"
+        empty_ps.write_text("#!/bin/sh\nexit 0\n")
+        empty_ps.chmod(0o700)
+        env = {**self.env, "FLIPAUTH_PS_BIN": str(empty_ps)}
+        script = REPO / "scripts/deploy-current.sh"
+
+        # --check fails before deployment and modifies nothing.
+        pre = subprocess.run(["bash", str(script), "--check"], env=env, capture_output=True, text=True)
+        self.assertNotEqual(pre.returncode, 0)
+        self.assertIn("legacy bind-current wrapper", pre.stderr)
+        self.assertTrue(legacy_codex.is_file())
+        self.assertFalse((self.home / ".local/flipauth/bin/codex").exists())
+        self.assertEqual((self.home / ".bashrc").read_text(), "# existing bashrc\n")
+
+        # Apply deploys both wrappers, migrates legacy codex wrapper, keeps official claude symlink, updates rc files.
+        apply_res = subprocess.run(["bash", str(script), "all"], env=env, capture_output=True, text=True)
+        self.assertEqual(apply_res.returncode, 0, apply_res.stderr)
+        self.assertTrue((self.home / ".local/flipauth/bin/codex").is_file())
+        self.assertTrue((self.home / ".local/flipauth/bin/claude").is_file())
+        self.assertFalse(legacy_codex.exists())
+        backups = list((self.root / "registry/launcher-backups").glob("*/codex"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(official_claude.is_symlink())
+        bashrc_once = (self.home / ".bashrc").read_text()
+        profile_once = (self.home / ".profile").read_text()
+        self.assertIn("$HOME/.local/flipauth/bin", bashrc_once)
+        self.assertIn("$HOME/.local/flipauth/bin", profile_once)
+
+        # Idempotent re-run does not duplicate PATH blocks.
+        apply_again = subprocess.run(["bash", str(script), "all"], env=env, capture_output=True, text=True)
+        self.assertEqual(apply_again.returncode, 0, apply_again.stderr)
+        self.assertEqual((self.home / ".bashrc").read_text(), bashrc_once)
+        self.assertEqual((self.home / ".profile").read_text(), profile_once)
+
+        # --check now passes cleanly.
+        post = subprocess.run(["bash", str(script), "--check"], env=env, capture_output=True, text=True)
+        self.assertEqual(post.returncode, 0, post.stderr)
+        self.assertIn("verified: " + str(self.home / ".local/flipauth/bin/codex"), post.stdout)
+        self.assertIn("verified: " + str(self.home / ".local/flipauth/bin/claude"), post.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

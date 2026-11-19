@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -99,7 +100,7 @@ def passes_through(service, values):
     return service == "claude" and any(value in {"-p", "--print"} for value in options)
 
 
-def switch(service, script, root, label, values):
+def switch(service, script, root, label, values, replace=False):
     from process_state import identity
     from session_switch import replace_processes
     from process_state import processes
@@ -122,11 +123,31 @@ def switch(service, script, root, label, values):
         try:
             target = Path(directory).resolve()
             running = processes(service)
-            if all(Path(fact["home"]).resolve() == target for fact in running.values()):
+            other_running = {pid: fact for pid, fact in running.items()
+                             if Path(fact["home"]).resolve() != target}
+            current_selected = data.get("selected", {}).get(service) or data.get("defaults", {}).get(service)
+            if not other_running:
                 # Same account (or nothing running): join it; stop nothing, keep its daemon.
                 record["mode"] = "same-account"
+            elif current_selected == label and not replace:
+                homes = {entry["directory"]: name for name, entry in data["accounts"][service].items()}
+                other_details = "; ".join(
+                    f"pid={pid} account={homes.get(fact['home'], 'unregistered')} "
+                    f"role={'app-server' if 'app-server' in fact['argv'] else 'cli'} home={fact['home']}"
+                    for pid, fact in sorted(other_running.items())
+                )
+                short_service = "cod" if service == "codex" else "cc"
+                accounts.refuse(
+                    f"{label} is already selected, but other-home {service} processes are running "
+                    f"({other_details}); no sessions stopped. Run plain `{service}` or "
+                    f"`flipauth {service} account run {label} --` to open another {label} session "
+                    f"without stopping them, or pass `--replace` (`flipauth {short_service} {label} --replace`) "
+                    f"to stop only the other-home sessions."
+                )
             else:
                 record["mode"] = "account-change"
+                if replace:
+                    record["replace"] = True
                 replace_processes(plan, root, record, receipt)
             if any(Path(fact["home"]).resolve() != target for fact in processes(service).values()):
                 accounts.refuse("same-service process appeared before launch; no new CLI started")
@@ -142,13 +163,30 @@ def switch(service, script, root, label, values):
             raise
 
 
+def _plain_cli_status(service):
+    found = shutil.which(service)
+    if not found:
+        return {"path": None, "follows_selection": False}
+    entry = Path(found)
+    try:
+        resolved = accounts.local_path(str(entry))
+        if any(p.suffix.lower() in {".exe", ".cmd", ".bat"} for p in (entry, resolved)):
+            return {"path": str(entry), "follows_selection": False}
+        with resolved.open("rb") as source:
+            header = source.read(256)
+        return {"path": str(entry), "follows_selection": b"# flipauth current launcher" in header}
+    except (accounts.Refused, OSError):
+        return {"path": str(entry), "follows_selection": False}
+
+
 def status(service, root, as_json=False):
     from process_state import processes, home_of, identity
     data = accounts.load_registry(root)
     label = data.get("selected", {}).get(service) or data.get("defaults", {}).get(service)
     report = {"service": service, "selected": data.get("selected", {}).get(service),
               "initial_default": data.get("defaults", {}).get(service),
-              "identity": "unverified", "processes": [], "observation_error": None,
+              "identity": "unverified", "plain_cli": _plain_cli_status(service),
+              "processes": [], "observation_error": None,
               "last_switch": None}
     if label:
         _, directory = accounts.account(data, service, label)
@@ -200,7 +238,15 @@ def status(service, root, as_json=False):
         print("directory: " + report["directory"])
         print("local login file: " + ("present (identity unverified)" if report["login_file_present"] else "missing"))
         print("launch selected: flipauth " + service + " account current --")
-    print("Plain " + service + " follows selection only after bind-current is installed on PATH.")
+    plain = report["plain_cli"]
+    if plain["follows_selection"]:
+        print(f"Plain {service} on PATH: {plain['path']} (follows selection via bind-current)")
+    elif plain["path"]:
+        print(f"Plain {service} follows selection only after bind-current is installed on PATH. "
+              f"Current PATH entry does not follow selection: {plain['path']}")
+    else:
+        print(f"Plain {service} follows selection only after bind-current is installed on PATH. "
+              f"No {service} found on PATH.")
     print("running processes: " + str(len(report["processes"])))
     for row in report["processes"]:
         print(f"  pid={row['pid']} account={row['account'] or 'unregistered'} role={row['role']} home={row['home']}")
@@ -208,6 +254,11 @@ def status(service, root, as_json=False):
         print("process observation unavailable: " + report["observation_error"])
     elif report["selection_matches_processes"] is False:
         print("selection differs from running process homes; selection is a launch preference, not request identity")
+        if label:
+            short_service = "cod" if service == "codex" else "cc"
+            print(f"other-home processes are running; `flipauth {short_service} {label}` will refuse by default "
+                  f"(use plain `{service}` or `account run {label}` to join without stopping them, "
+                  f"or pass `--replace` to stop only other-home {service} sessions and keep {label}).")
     if report["last_switch"]:
         record = report["last_switch"]
         print("last switch: " + record["state"] + " -> " + str(record["target"]))
@@ -227,11 +278,13 @@ def main():
     script = Path(executable).resolve()
     root = accounts.local_path(os.environ.get("FLIPAUTH_ACCOUNTS_DIR", str(Path.home() / ".local/state/flipauth")))
     if not values or values == ["--help"]:
-        print("Usage: flipauth <cod|cc> <NAME> [login] [-- CLI arguments]\n"
+        print("Usage: flipauth <cod|cc> <NAME> [login|--replace] [-- CLI arguments]\n"
               "       flipauth <cod|cc> new <NAME>\n"
               "       flipauth <cod|cc> status [--json]|list\n"
-              "Same account: opens one more CLI. Another account running: stops all same-service CLIs and\n"
-              "daemons first. Subcommands such as exec/login/--version run without switching.\n"
+              "Same account: opens one more CLI. Switching to another account (or passing --replace)\n"
+              "stops only other-home CLIs and daemons while keeping target-home sessions alive.\n"
+              "If target is already selected while other-home processes run, refuses by default.\n"
+              "Subcommands such as exec/login/--version run without switching.\n"
               "Login creates a fresh named directory if absent. No legacy snapshots are imported.")
         return
     if values in (["status"], ["status", "--json"]):
@@ -254,7 +307,13 @@ def main():
         else:
             if rest[:1] == ["--"]:
                 rest = rest[1:]
-            switch(service, script, root, label, rest)
+            replace = False
+            if rest[:1] == ["--replace"]:
+                replace = True
+                rest = rest[1:]
+                if rest[:1] == ["--"]:
+                    rest = rest[1:]
+            switch(service, script, root, label, rest, replace=replace)
 
 
 if __name__ == "__main__":

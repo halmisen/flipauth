@@ -203,9 +203,17 @@ def exit_in_band(clients, timeout, changed=lambda: None):
             time.sleep(.05)
 
 
-def stop_managed_daemons(service, root, daemon_starts, timeout):
-    remaining = processes(service)
-    fresh = verified_daemons(service, root)
+def _other_processes(service, target):
+    all_procs = processes(service)
+    if target is None:
+        return all_procs
+    return {pid: fact for pid, fact in all_procs.items() if Path(fact["home"]).resolve() != target}
+
+
+def stop_managed_daemons(service, root, daemon_starts, timeout, target=None):
+    remaining = _other_processes(service, target)
+    fresh_all = verified_daemons(service, root)
+    fresh = {pid for pid in fresh_all if pid in remaining} if target is not None else fresh_all
     if set(remaining) - fresh or fresh - set(daemon_starts):
         accounts.refuse("unexpected same-service process appeared; selection unchanged")
     for pid in daemon_stop_order(set(daemon_starts) & set(remaining), remaining):
@@ -222,9 +230,9 @@ def stop_managed_daemons(service, root, daemon_starts, timeout):
             accounts.refuse("managed daemon identity changed; no restart")
         terminate(pid, start, timeout)
     deadline = time.monotonic() + timeout
-    while processes(service) and time.monotonic() < deadline:
+    while _other_processes(service, target) and time.monotonic() < deadline:
         time.sleep(.1)
-    if processes(service):
+    if _other_processes(service, target):
         accounts.refuse("same-service processes remain; no restart")
 
 
@@ -236,10 +244,15 @@ def switch_timeout():
 
 
 def replace_processes(plan, root, record, receipt):
-    """Preflight the whole service before sending the first termination signal."""
+    """Preflight the whole service before sending the first termination signal.
+
+    Only non-target CLIs and non-target managed daemons (home != target) are
+    stopped; already-running target CLIs and target daemons are preserved.
+    """
     from short_commands import receipt_write
     timeout = switch_timeout()
     service = plan.service
+    target = plan.home.resolve()
     data = accounts.load_registry(root)
     running = processes(service)
     daemons = verified_daemons(service, root)
@@ -247,10 +260,15 @@ def replace_processes(plan, root, record, receipt):
         accounts.refuse("managed daemon appeared during preflight; no sessions stopped")
     if set(running) & ancestor_pids():
         accounts.refuse("switch must run in a separate terminal, outside a running CLI")
+    other_running = {pid: fact for pid, fact in running.items() if Path(fact["home"]).resolve() != target}
+    kept_running = {pid: fact for pid, fact in running.items() if Path(fact["home"]).resolve() == target}
+    other_daemons = {pid for pid in daemons if pid in other_running}
+    kept_daemons = {pid for pid in daemons if pid in kept_running}
     allowed = {str(Path.home() / ("." + service))}
     allowed.update(entry["directory"] for entry in data["accounts"][service].values())
-    clients = {pid: fact for pid, fact in running.items() if pid not in daemons}
-    for fact in clients.values():
+    other_clients = {pid: fact for pid, fact in other_running.items() if pid not in other_daemons}
+    kept_clients = {pid: fact for pid, fact in kept_running.items() if pid not in kept_daemons}
+    for fact in other_clients.values():
         if fact["home"] not in allowed:
             accounts.refuse("unregistered CLI home; all sessions left untouched")
         if any(fact["environment"].get(key.encode()) for key in accounts.ENV_CONFLICTS[service]):
@@ -259,16 +277,20 @@ def replace_processes(plan, root, record, receipt):
         options = command[:command.index("--")] if "--" in command else command
         if any(argument in {"app-server", "remote-control"} for argument in options):
             accounts.refuse("unmanaged background server found; all sessions left untouched")
-    panes = locate_in_band(service, clients)
-    # All births must still match before any admitted client is stopped.
-    if any(identity(pid) not in (None, fact["start"]) for pid, fact in running.items()):
+    panes = locate_in_band(service, other_clients)
+    # All non-target births must still match before any admitted client is stopped.
+    if any(identity(pid) not in (None, fact["start"]) for pid, fact in other_running.items()):
         accounts.refuse("process birth changed during preflight; all sessions left untouched")
     record["stopped_cli"] = [{"pid": pid, "start": fact["start"], "home": fact["home"],
                               "state": "planned", **({"exit": "ctrl+c", **panes[pid]}
                                                      if pid in panes else {"exit": "SIGTERM"})}
-                             for pid, fact in clients.items()]
+                             for pid, fact in other_clients.items()]
     record["stopped_daemon"] = [{"pid": pid, "start": running[pid]["start"],
-                                 "home": running[pid]["home"], "state": "planned"} for pid in daemons]
+                                 "home": running[pid]["home"], "state": "planned"} for pid in other_daemons]
+    record["kept_cli"] = [{"pid": pid, "start": fact["start"], "home": fact["home"]}
+                          for pid, fact in kept_clients.items()]
+    record["kept_daemon"] = [{"pid": pid, "start": running[pid]["start"], "home": running[pid]["home"]}
+                             for pid in kept_daemons]
     record["state"] = "stopping"
     receipt_write(receipt, record)
     try:
@@ -280,7 +302,7 @@ def replace_processes(plan, root, record, receipt):
             client["state"] = "exited"
             receipt_write(receipt, record)
         stop_managed_daemons(service, root,
-                             {pid: running[pid]["start"] for pid in daemons}, timeout)
+                             {pid: running[pid]["start"] for pid in other_daemons}, timeout, target=target)
     finally:
         reconcile(record)
         receipt_write(receipt, record)

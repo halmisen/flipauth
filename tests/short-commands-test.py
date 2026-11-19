@@ -437,25 +437,96 @@ class ShortCommands(unittest.TestCase):
         self.assertFalse(any(e[0] in {'send-keys','exited','daemon-stopped'} for e in events))
         self.assertEqual(self.record(first)['args'],['--once'])
 
-    def test_account_change_closes_every_pane_in_parallel_and_all_daemons(self):
+    def test_account_change_closes_only_other_home_panes_in_parallel_and_keeps_target(self):
         first,second=self.setup_accounts()
         panes=[self.start(name,'codex',first) for name in ('a','b','c')]
         target_pane=self.start('d','codex',second)
         started=time.monotonic()
-        self.short('cod','primary')
+        # primary is selected; switching to secondary stops only primary's panes & daemon, keeping secondary's.
+        self.short('cod','secondary')
         elapsed=time.monotonic()-started
-        for process in [*panes, target_pane]: self.assertEqual(process.wait(timeout=3),0)
-        for name in 'abcd': self.assert_terminal_restored(name)
+        for process in panes: self.assertEqual(process.wait(timeout=3),0)
+        for name in 'abc': self.assert_terminal_restored(name)
+        self.assertIsNone(target_pane.poll())
         receipt=self.receipt()
         self.assertEqual(receipt['mode'],'account-change')
-        self.assertEqual(len(receipt['stopped_cli']),4)
-        # Parallel: every pane gets its first Ctrl+C before any pane has quit.
+        self.assertEqual({row['pid'] for row in receipt['stopped_cli']},{p.pid for p in panes})
+        self.assertEqual({row['pid'] for row in receipt['kept_cli']},{target_pane.pid})
+        self.assertEqual(len(receipt['stopped_daemon']),2)
+        self.assertEqual(len(receipt['kept_daemon']),2)
+        # Parallel: every non-target pane gets its first key before any pane has quit.
         events=self.state()['events']
         first_exit=next(i for i,e in enumerate(events) if e[0]=='exited')
         keyed={e[1] for e in events[:first_exit] if e[0]=='send-keys'}
-        self.assertEqual(keyed,set('abcd'))
+        self.assertEqual(keyed,set('abc'))
         self.assertLess(elapsed,6)
-        self.assertEqual(len([e for e in self.state()['events'] if e[0]=='daemon-stopped']),4)
+        stopped_daemons=[e for e in events if e[0]=='daemon-stopped']
+        self.assertEqual(len(stopped_daemons),2)
+        self.assertTrue(all(e[2]==str(first) for e in stopped_daemons))
+
+    def test_mixed_account_refuses_when_target_already_selected_unless_replace_passed(self):
+        first,second=self.setup_accounts()
+        keep_pane=self.start('a','codex',first)
+        other_pane=self.start('b','codex',second)
+        launcher=self.bin/'codex-primary'
+        self.call('codex','bind','primary',launcher,'--switch')
+
+        # primary is already selected, secondary is running: default switch refuses and stops nothing.
+        refused=self.short('cod','primary',ok=False)
+        self.assertIn(str(other_pane.pid),refused.stderr)
+        self.assertIn('secondary',refused.stderr)
+        self.assertIn(str(second),refused.stderr)
+        self.assertIn('account run primary',refused.stderr)
+        self.assertIn('--replace',refused.stderr)
+        self.assertEqual(self.receipt()['state'],'failed')
+        self.assertIsNone(keep_pane.poll())
+        self.assertIsNone(other_pane.poll())
+        events=self.state()['events']
+        self.assertFalse(any(e[0] in {'send-keys','exited','daemon-stopped'} for e in events))
+
+        # Named launcher without --replace also refuses and stops nothing.
+        master,slave=pty.openpty()
+        try:
+            wrapped_refused=subprocess.run([str(launcher),'--once'],env=self.env,stdin=slave,
+                                           capture_output=True,text=True,timeout=12)
+        finally:
+            os.close(master); os.close(slave)
+        self.assertNotEqual(wrapped_refused.returncode,0)
+        self.assertIn('--replace',wrapped_refused.stderr)
+        self.assertIsNone(keep_pane.poll())
+        self.assertIsNone(other_pane.poll())
+
+        # Named launcher with --replace stops ONLY secondary CLI + daemon, keeping primary alive.
+        master,slave=pty.openpty()
+        try:
+            replaced=subprocess.run([str(launcher),'--replace','--','--once'],env=self.env,stdin=slave,
+                                    capture_output=True,text=True,timeout=12)
+        finally:
+            os.close(master); os.close(slave)
+        self.assertEqual(replaced.returncode,0,replaced.stderr)
+        self.assertEqual(other_pane.wait(timeout=3),0)
+        self.assert_terminal_restored('b')
+        self.assertIsNone(keep_pane.poll())
+        receipt=self.receipt()
+        self.assertEqual(receipt['state'],'exec-admitted',receipt)
+        self.assertTrue(receipt.get('replace'))
+        self.assertEqual({row['pid'] for row in receipt['stopped_cli']},{other_pane.pid})
+        self.assertEqual({row['pid'] for row in receipt['kept_cli']},{keep_pane.pid})
+        self.assertEqual(len(receipt['stopped_daemon']),2)
+        self.assertEqual(len(receipt['kept_daemon']),2)
+        stopped_daemons=[e for e in self.state()['events'] if e[0]=='daemon-stopped']
+        self.assertEqual(len(stopped_daemons),2)
+        self.assertTrue(all(e[2]==str(second) for e in stopped_daemons))
+
+    def test_migrate_default_refuses_while_default_home_process_is_running(self):
+        first,_=self.setup_accounts()
+        running=self.start('a','codex',first)
+        target=self.home/'.codex-primary'
+        result=self.call('codex','migrate-default','primary',target,ok=False)
+        self.assertIn(str(running.pid),result.stderr)
+        self.assertFalse(target.exists())
+        self.assertTrue((first/'auth.json').is_file())
+        self.assertIsNone(running.poll())
 
     def test_non_interactive_subcommands_never_switch(self):
         first,second=self.setup_accounts()

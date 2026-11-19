@@ -89,7 +89,7 @@ Launch the current selection:
 flipauth codex account current --
 ```
 
-Explicitly switch all same-service CLI sessions, including busy sessions:
+Explicitly switch away from other-account same-service CLI sessions, including busy sessions:
 
 ```sh
 flipauth cod secondary
@@ -97,12 +97,22 @@ flipauth cc primary
 ```
 
 Run these commands in a separate terminal, outside any running agent's tool shell.
-They preflight all same-service processes, close old CLIs, wait for exit, then stop verified managed daemon updaters and servers. A fresh official CLI
+When switching to a different selection (`selected != target`) or passing `--replace`,
+they preflight all same-service processes, close only other-home CLIs (`home != target`),
+wait for exit, then stop only verified other-home managed daemon updaters and servers,
+while preserving any already-running target-home CLIs and target-home daemons
+(recorded under `kept_cli`/`kept_daemon` in the receipt). A fresh official CLI
 starts only in the requesting terminal and working directory. Old terminals return
 to their shells. If only the target account (or nothing) is running, the command just
-opens one more CLI and stops nothing; daemons are stopped only on an account change.
+opens one more CLI and stops nothing; daemons are stopped only when other-home processes exist.
+If the target is already selected (`selected == target`) while other-home processes are
+running, the switch command refuses in preflight without stopping anything: run plain
+`codex`/`claude` (with `bind-current`) or `flipauth <service> account run <name> --` to
+open another session without disturbing peers, or pass `--replace` (for example
+`codex-primary --replace` or `flipauth cod primary --replace`) to stop only the
+other-home sessions.
 Subcommands such as `exec`, `login`, `mcp` and `--version` run in that account without
-switching. Ctrl+C reaches all old Codex panes in parallel. The other service is
+switching. Ctrl+C reaches all old other-home Codex panes in parallel. The other service is
 left alone; file edits already made by interrupted tasks remain.
 
 Codex only restores its terminal when it quits from keyboard input, so old Codex CLIs
@@ -165,9 +175,35 @@ To make plain `codex` follow the selection, stage a separate wrapper:
 mkdir -p "$HOME/.local/flipauth/bin" && flipauth codex account bind-current "$HOME/.local/flipauth/bin/codex"
 ```
 
+Or use the idempotent deployment/verification helper (which binds `~/.local/flipauth/bin/<service>`,
+adds the PATH block to `~/.bashrc` and `~/.profile`, migrates any legacy `# flipauth current launcher`
+file out of `~/.local/bin/<service>` into `~/.local/state/flipauth/launcher-backups/<timestamp>/`
+without touching real official binaries/symlinks, and prints `status`):
+
+```sh
+bash scripts/deploy-current.sh [codex|claude|all] [--check]
+```
+
 Review it, then put that directory before the official CLI on PATH in your shell.
-Use the same procedure for `claude`. Existing files and symlinks are never replaced.
-Without the wrapper, plain native commands do not consult FlipAuth selection.
+Use the same procedure for `claude`. Existing files and symlinks are never replaced, and
+`bind-current` refuses to write into the official binary's or official symlink's directory
+(such as `~/.local/bin` when `~/.local/bin/codex` is the official symlink) so provider
+upgrades cannot overwrite the wrapper. Without the wrapper, plain native commands do not
+consult FlipAuth selection.
+
+To make the default home (`~/.codex` or `~/.claude`) Fail-Closed so an accidental un-wrapped
+launch cannot silently use a registered account's credentials, move that default-home account
+into a dedicated directory once no processes are using the default home:
+
+```sh
+flipauth codex account migrate-default primary "$HOME/.codex-primary" --dry-run
+flipauth codex account migrate-default primary "$HOME/.codex-primary"
+```
+
+`migrate-default` verifies zero same-service processes are running in the default home,
+atomically moves account state without reading credentials, updates `accounts.json`, and
+(for Codex) keeps `~/.codex/packages/` in place so standalone symlinks such as
+`~/.local/bin/codex` remain intact while `~/.codex` has no `auth.json`.
 
 Binding records the stable official executable in the registry for every entrypoint.
 It does not write a release-number path into the wrapper. PATH discovery skips FlipAuth
@@ -239,8 +275,12 @@ ls -lt "$HOME/.local/state/flipauth/switches" | head
 ## 简体中文
 
 FlipAuth 为每个账号指定独立目录，启动原生 Claude Code 或 Codex。登录、刷新和请求
-由官方客户端完成。`account run` 单独启动指定账号；`cod/cc NAME` 明确切换同服务全部
-会话（对 Herdr 内正处于 `working` 回合的 Codex 先发 `Esc` 中断，再发 `Ctrl+C` 退出）。
+由官方客户端完成。`account run` 单独启动指定账号；`cod/cc NAME` 仅关闭非目标账号的
+同服务会话与 daemon（保留已运行的目标账号会话，对 Herdr 内正处于 `working` 回合的
+Codex 先发 `Esc` 中断，再发 `Ctrl+C` 退出）；若目标账号已是当前选中且场上仍有异号进程，
+默认预检拒绝而不停任何进程，可用裸命令 / `account run` 直接加开或显式传 `--replace` 清场。
+`bind-current` 必须放在独立优先目录（如 `~/.local/flipauth/bin/`），禁止写入官方二进制或官方软链目录以防升级覆写；
+`account migrate-default <name> <new-dir>` 可在默认目录无进程运行时将默认目录账号迁至独立目录（Codex 保留 `~/.codex/packages/` 不断链），使默认目录无 `auth.json` 实现 Fail-Closed。
 `status` 分别显示启动选择和实际进程目录，不把账号标签当成真实身份验证。
 不使用网关，不复制凭据，不查询配额，不自动安装 PATH 包装或修改已有登录。
 
