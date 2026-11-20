@@ -357,6 +357,15 @@ def check_arguments(service, arguments):
                     refuse("CLI config override conflicts with directory login")
 
 
+def standalone_install_home(binary):
+    """Home owning an official `<home>/packages/standalone/...` executable, if any."""
+    for parent in Path(os.path.realpath(binary)).parents:
+        if parent.name == "standalone" and parent.parent.name == "packages":
+            home = parent.parent.parent
+            return home if home.is_dir() and not home.is_symlink() else None
+    return None
+
+
 def prepare_launch(service, script, data, args):
     from official_cli import LaunchPlan
     _, directory = account(data, service, args.name)
@@ -385,6 +394,10 @@ def prepare_launch(service, script, data, args):
     check_arguments(service, arguments)
     binary = cli_binary(service, script)
     env = os.environ.copy()
+    if service == "codex" and arguments[:1] == ["update"]:
+        # The standalone updater detects its install method from CODEX_HOME, and after
+        # migrate-default the package stays in the default home. Updating needs no login.
+        directory = standalone_install_home(binary) or directory
     env["CLAUDE_CONFIG_DIR" if service == "claude" else "CODEX_HOME"] = str(directory)
     # Herdr can identify the official process even if an explicitly configured
     # executable has a version-number basename. Scope the hint to this child.

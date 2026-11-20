@@ -159,6 +159,29 @@ class LauncherContract(unittest.TestCase):
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(self.calls(home)[-1]["version"], "claude-v2")
 
+    def test_codex_update_runs_in_the_standalone_install_home(self):
+        # Official standalone layout: <install home>/packages/standalone/current -> releases/<v>.
+        # `codex update` detects its install method from CODEX_HOME, so after
+        # migrate-default it must run in the home that owns the package, not the account.
+        install = self.home / ".codex"
+        release = install / "packages/standalone/releases/v1"
+        (release / "bin").mkdir(parents=True)
+        (release / "bin/codex").write_text(FAKE_CLI)
+        (release / "bin/codex").chmod(0o700)
+        (install / "packages/standalone/current").symlink_to(release)
+        (self.native / "codex").unlink()
+        (self.native / "codex").symlink_to(install / "packages/standalone/current/bin/codex")
+        account = self.account("codex", "work", default=True)
+        self.cli("codex", "account", "bind-current", self.wrappers / "codex")
+        for argv in (["codex", "update"], [str(REPO / "flipauth"), "cod", "work", "update"]):
+            result = subprocess.run(argv, env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c["args"] for c in self.calls(install)], [["update"], ["update"]])
+        self.assertEqual(self.calls(account), [])
+        # Every other invocation still runs in the selected account home.
+        subprocess.run(["codex", "exec", "hi"], env=self.env, check=True, capture_output=True)
+        self.assertEqual(self.calls(account)[-1]["args"], ["exec", "hi"])
+
     def test_explicit_run_and_login_do_not_change_selection_or_default(self):
         for service in ("claude", "codex"):
             self.account(service, "primary", default=True)
