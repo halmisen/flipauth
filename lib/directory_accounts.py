@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -580,6 +581,30 @@ def _replace_symlink(link, target):
         raise
 
 
+MIGRATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+
+
+@contextlib.contextmanager
+def _deferred_signals():
+    """Record interrupting signals instead of acting on them; yields the list."""
+    caught = []
+    previous = {}
+    try:
+        for number in MIGRATION_SIGNALS:
+            previous[number] = signal.signal(number, lambda signum, frame: caught.append(signum))
+        yield caught
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def _registry_directory(root, service, account_name):
+    try:
+        return load_registry(root)["accounts"][service][account_name]["directory"]
+    except (Refused, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _rollback(journal):
     """Undo journalled steps in reverse; return the steps that could not be undone."""
     failed = []
@@ -663,47 +688,67 @@ def migrate_default(service, root, args):
                       f"rewriting {len(links)} daemon symlink(s)) "
                       f"and update {service}/{args.name} in registry")
                 return
-            # Every step is journalled; any failure (including the registry write,
-            # which is last) undoes the journal so a rerun starts from scratch.
+            # Every step is journalled; any failure before the registry commit undoes
+            # the journal so a rerun starts from scratch. Interrupting signals are
+            # only recorded while files move, so no signal lands between a step and
+            # its journal entry: one arriving before the commit aborts at the next
+            # step boundary and rolls back; one arriving after it lets the
+            # completed migration report, then exits with the signal status.
             journal = []
-            try:
-                new_dir.mkdir(mode=0o700)
-                journal.append(("mkdir", new_dir))
-                for item in to_move:
-                    os.rename(default_home / item, new_dir / item)
-                    journal.append(("rename", default_home / item, new_dir / item))
-                if daemon:
-                    new_packages = new_dir / "packages"
-                    new_packages.mkdir(mode=0o700)
-                    journal.append(("mkdir", new_packages))
-                    new_daemon = new_packages / CODEX_DAEMON_PACKAGE
-                    os.rename(daemon, new_daemon)
-                    journal.append(("rename", daemon, new_daemon))
-                    for relative, inside in links:
-                        link = new_daemon / relative
-                        old_target = os.readlink(link)
-                        _replace_symlink(link, new_daemon / inside)
-                        journal.append(("relink", link, old_target))
-                    real_new = new_daemon.resolve()
-                    for relative, inside, outside in checks:
-                        want = real_new / inside if inside is not None else outside
-                        got = Path(os.path.realpath(new_daemon / relative))
-                        if got != want or not (new_daemon / relative).exists():
-                            raise OSError(f"daemon symlink {relative} resolves to {got}, expected {want}")
-                entry["directory"] = str(new_dir)
-                write_registry(root, data)
-            except BaseException as error:
-                entry["directory"] = str(default_home)
-                failed = _rollback(journal)
-                if failed:
-                    refuse(f"migration failed ({error}) and rollback is INCOMPLETE; registry still points "
-                           f"to {default_home}; restore by hand: {'; '.join(failed)}")
-                refuse(f"migration failed ({error}); rolled back, nothing changed; fix the cause and rerun")
-    credential = "auth.json" if service == "codex" else ".credentials.json"
-    still_present = (default_home / credential).exists()
-    print(f"migrated {service} {args.name}: {default_home} -> {new_dir} "
-          f"(moved={len(moved)}, rewritten_links={len(links)}, kept_in_default={','.join(kept) or 'none'}, "
-          f"default_{credential}={'present' if still_present else 'absent'})")
+            with _deferred_signals() as caught:
+
+                def record(step):
+                    journal.append(step)
+                    if caught:
+                        raise InterruptedError(f"interrupted by signal {caught[0]}")
+
+                try:
+                    new_dir.mkdir(mode=0o700)
+                    record(("mkdir", new_dir))
+                    for item in to_move:
+                        os.rename(default_home / item, new_dir / item)
+                        record(("rename", default_home / item, new_dir / item))
+                    if daemon:
+                        new_packages = new_dir / "packages"
+                        new_packages.mkdir(mode=0o700)
+                        record(("mkdir", new_packages))
+                        new_daemon = new_packages / CODEX_DAEMON_PACKAGE
+                        os.rename(daemon, new_daemon)
+                        record(("rename", daemon, new_daemon))
+                        for relative, inside in links:
+                            link = new_daemon / relative
+                            old_target = os.readlink(link)
+                            _replace_symlink(link, new_daemon / inside)
+                            record(("relink", link, old_target))
+                        real_new = new_daemon.resolve()
+                        for relative, inside, outside in checks:
+                            want = real_new / inside if inside is not None else outside
+                            got = Path(os.path.realpath(new_daemon / relative))
+                            if got != want or not (new_daemon / relative).exists():
+                                raise OSError(f"daemon symlink {relative} resolves to {got}, expected {want}")
+                    entry["directory"] = str(new_dir)
+                    write_registry(root, data)
+                except BaseException as error:
+                    if _registry_directory(root, service, args.name) == str(new_dir):
+                        # The atomic registry replace already happened: keep the moved state.
+                        refuse(f"migration committed to the registry but then reported {error}; "
+                               f"{service}/{args.name} now lives in {new_dir}; nothing rolled back")
+                    entry["directory"] = str(default_home)
+                    failed = _rollback(journal)
+                    if failed:
+                        refuse(f"migration failed ({error}) and rollback is INCOMPLETE; registry still points "
+                               f"to {default_home}; restore by hand: {'; '.join(failed)}")
+                    refuse(f"migration failed ({error}); rolled back, nothing changed; fix the cause and rerun")
+                credential = "auth.json" if service == "codex" else ".credentials.json"
+                still_present = (default_home / credential).exists()
+                print(f"migrated {service} {args.name}: {default_home} -> {new_dir} "
+                      f"(moved={len(moved)}, rewritten_links={len(links)}, "
+                      f"kept_in_default={','.join(kept) or 'none'}, "
+                      f"default_{credential}={'present' if still_present else 'absent'})", flush=True)
+                if caught:
+                    print(f"flipauth: signal {caught[0]} arrived after the registry commit; "
+                          "migration is complete", file=sys.stderr, flush=True)
+                    raise SystemExit(128 + caught[0])
 
 
 def main():

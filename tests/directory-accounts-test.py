@@ -621,6 +621,58 @@ class Accounts(unittest.TestCase):
         self.call("codex", "migrate-default", "sen", target_dir, env=env)
         self._assert_migrated(target_dir)
 
+    def _signal_injection_env(self, env, spec):
+        # Test-only: wrap os.rename/os.replace in the migrating process and send a
+        # real signal to itself right after the named step returns.
+        inject = self.root / "inject"
+        inject.mkdir(exist_ok=True)
+        (inject / "sitecustomize.py").write_text(
+            "import os, signal\n"
+            "_spec = os.environ.get('FLIPAUTH_TEST_INJECT')\n"
+            "if _spec:\n"
+            "    _kind, _name, _sig = _spec.split(':')\n"
+            "    _real = getattr(os, _kind)\n"
+            "    _fired = []\n"
+            "    def _wrapped(src, dst, *a, **k):\n"
+            "        result = _real(src, dst, *a, **k)\n"
+            "        watched = dst if _kind == 'replace' else src\n"
+            "        if not _fired and os.path.basename(str(watched)) == _name:\n"
+            "            _fired.append(1)\n"
+            "            os.kill(os.getpid(), getattr(signal, _sig))\n"
+            "        return result\n"
+            "    setattr(os, _kind, _wrapped)\n")
+        return {**env, "PYTHONPATH": str(inject), "FLIPAUTH_TEST_INJECT": spec}
+
+    def test_migrate_default_signal_after_a_move_rolls_back_completely(self):
+        for sig in ("SIGINT", "SIGTERM"):
+            with self.subTest(sig):
+                default_dir, daemon, env = self._codex_default_with_daemon()
+                target_dir = self.home / ".codex-sen"
+                try:
+                    before = self._migration_snapshot(default_dir)
+                    hit = self._signal_injection_env(env, f"rename:auth.json:{sig}")
+                    res = self.call("codex", "migrate-default", "sen", target_dir, env=hit, ok=False)
+                    self.assertIn("rolled back, nothing changed", res.stderr)
+                    self.assertFalse(target_dir.exists())
+                    self.assertEqual(self._migration_snapshot(default_dir), before)
+                    self.call("codex", "migrate-default", "sen", target_dir, env=env)
+                    self._assert_migrated(target_dir)
+                finally:
+                    subprocess.run(["rm", "-rf", str(default_dir), str(target_dir),
+                                    str(self.root / "registry")], check=True)
+
+    def test_migrate_default_signal_after_registry_commit_keeps_the_completed_migration(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        target_dir = self.home / ".codex-sen"
+        hit = self._signal_injection_env(env, "replace:accounts.json:SIGINT")
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=hit, ok=False)
+        self.assertEqual(res.returncode, 128 + signal.SIGINT, res.stderr)
+        self.assertIn("migrated codex sen", res.stdout)
+        self.assertIn("migration is complete", res.stderr)
+        self.assertNotIn("rolled back", res.stderr)
+        self._assert_migrated(target_dir)
+        self.assertEqual(sorted(p.name for p in default_dir.iterdir()), ["packages"])
+
     def test_migrate_default_symlinked_default_home_rewrites_literal_links(self):
         default_dir, daemon, env = self._codex_default_with_daemon(real_name="codex-real")
         self.assertTrue(os.readlink(default_dir / "packages/app-server-daemon/current").startswith(str(default_dir) + "/"))
