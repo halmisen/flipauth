@@ -220,9 +220,13 @@ the rollback itself fails does it report `rollback is INCOMPLETE` with the steps
 by hand; the registry still points at the default home in that case.
 
 While files move, SIGINT/SIGTERM/SIGHUP/SIGQUIT are recorded rather than acted on, so a
-signal never lands between a step and its journal entry. A signal before the registry commit
-aborts at the next step and rolls back; one after the commit lets the finished migration
-print its result and then exits with status 128+signal. SIGKILL or a power loss cannot be
+signal never lands between a step and its journal entry. The last abort check runs after the
+new registry content is staged and immediately before its atomic replace (the commit point):
+a signal recorded by then aborts and rolls back; a later one lets the finished migration
+print its result and then exits with status 128+signal. If a failure is reported around the
+replace, the staged file's inode decides: replaced means the migration is kept and reported
+as committed; not replaced means rollback; if the registry cannot even be stat'ed, nothing is
+rolled back and the commit state is reported as `UNKNOWN` for manual inspection. SIGKILL or a power loss cannot be
 deferred and may leave a partial move; the registry then still names the default home, and
 the moved entries are under the target directory.
 
@@ -301,7 +305,7 @@ FlipAuth 为每个账号指定独立目录，启动原生 Claude Code 或 Codex�
 Codex 先发 `Esc` 中断，再发 `Ctrl+C` 退出）；若目标账号已是当前选中且场上仍有异号进程，
 默认预检拒绝而不停任何进程，可用裸命令 / `account run` 直接加开或显式传 `--replace` 清场。
 `bind-current` 必须放在独立优先目录（如 `~/.local/flipauth/bin/`），禁止写入官方二进制或官方软链目录以防升级覆写；
-`account migrate-default <name> <new-dir>` 可在默认目录无进程运行时将默认目录账号迁至独立目录（Codex 只保留 `~/.codex/packages/standalone` 不断链；按 home 分装的 `packages/app-server-daemon` 随账号迁走，其绝对软链 `current` 改指新目录下同一 release；遇未知包类型或指向旧目录其他位置的 daemon 软链则迁移前拒绝），使默认目录无 `auth.json` 实现 Fail-Closed。迁移全有或全无：移动前预检源/目标/daemon 目录可写、daemon 软链不越出 daemon 包（含指向旧目录根的绝对链、`../standalone` 类相对链）、子目录可读，否则拒绝且零移动；移动中任一步（含最后的注册表写入、迁后软链解析校验）失败即按日志逆序回滚并报 `rolled back, nothing changed`，修复原因后可直接重跑；仅回滚本身失败时报 `rollback is INCOMPLETE` 并列出手工恢复步骤，此时注册表仍指向默认目录。搬移期间 SIGINT/SIGTERM/SIGHUP/SIGQUIT 只记录不立即生效：注册表提交前收到则在下一步中止并回滚，提交后收到则让已完成的迁移输出结果后以 128+信号值退出；SIGKILL 或断电无法延后，可能留下半迁移（注册表仍指向默认目录，已移条目在目标目录下）。
+`account migrate-default <name> <new-dir>` 可在默认目录无进程运行时将默认目录账号迁至独立目录（Codex 只保留 `~/.codex/packages/standalone` 不断链；按 home 分装的 `packages/app-server-daemon` 随账号迁走，其绝对软链 `current` 改指新目录下同一 release；遇未知包类型或指向旧目录其他位置的 daemon 软链则迁移前拒绝），使默认目录无 `auth.json` 实现 Fail-Closed。迁移全有或全无：移动前预检源/目标/daemon 目录可写、daemon 软链不越出 daemon 包（含指向旧目录根的绝对链、`../standalone` 类相对链）、子目录可读，否则拒绝且零移动；移动中任一步（含最后的注册表写入、迁后软链解析校验）失败即按日志逆序回滚并报 `rolled back, nothing changed`，修复原因后可直接重跑；仅回滚本身失败时报 `rollback is INCOMPLETE` 并列出手工恢复步骤，此时注册表仍指向默认目录。搬移期间 SIGINT/SIGTERM/SIGHUP/SIGQUIT 只记录不立即生效：最后一次中止检查在新注册表内容暂存后、原子替换（提交点）前，此前收到则中止并回滚，此后收到则让已完成的迁移输出结果后以 128+信号值退出；替换前后报错时按暂存文件 inode 判定：已替换则保留迁移并报已提交，未替换才回滚，注册表连 stat 都失败则不回滚并报 `UNKNOWN` 待人工核对；SIGKILL 或断电无法延后，可能留下半迁移（注册表仍指向默认目录，已移条目在目标目录下）。
 `status` 分别显示启动选择和实际进程目录，不把账号标签当成真实身份验证。
 不使用网关，不复制凭据，不查询配额，不自动安装 PATH 包装或修改已有登录。
 

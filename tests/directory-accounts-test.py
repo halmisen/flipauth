@@ -626,21 +626,35 @@ class Accounts(unittest.TestCase):
         # real signal to itself right after the named step returns.
         inject = self.root / "inject"
         inject.mkdir(exist_ok=True)
+        # spec = kind:name:action. kind rename/replace match the source/destination
+        # basename; mkstemp matches the prefix. action is a signal name, or
+        # raise-file / raise-dir: make accounts.json unreadable (or its directory
+        # unsearchable) and then raise, after the real call succeeded.
         (inject / "sitecustomize.py").write_text(
-            "import os, signal\n"
+            "import os, signal, tempfile\n"
             "_spec = os.environ.get('FLIPAUTH_TEST_INJECT')\n"
             "if _spec:\n"
-            "    _kind, _name, _sig = _spec.split(':')\n"
-            "    _real = getattr(os, _kind)\n"
+            "    _kind, _name, _action = _spec.split(':')\n"
+            "    _owner = tempfile if _kind == 'mkstemp' else os\n"
+            "    _real = getattr(_owner, _kind)\n"
             "    _fired = []\n"
-            "    def _wrapped(src, dst, *a, **k):\n"
-            "        result = _real(src, dst, *a, **k)\n"
-            "        watched = dst if _kind == 'replace' else src\n"
-            "        if not _fired and os.path.basename(str(watched)) == _name:\n"
+            "    def _wrapped(*a, **k):\n"
+            "        result = _real(*a, **k)\n"
+            "        if _kind == 'mkstemp':\n"
+            "            watched = k.get('prefix', '')\n"
+            "        else:\n"
+            "            watched = os.path.basename(str(a[1] if _kind == 'replace' else a[0]))\n"
+            "        if not _fired and watched == _name:\n"
             "            _fired.append(1)\n"
-            "            os.kill(os.getpid(), getattr(signal, _sig))\n"
+            "            if _action == 'raise-file':\n"
+            "                os.chmod(a[1], 0)\n"
+            "                raise OSError('injected failure after replace')\n"
+            "            if _action == 'raise-dir':\n"
+            "                os.chmod(os.path.dirname(str(a[1])), 0)\n"
+            "                raise OSError('injected failure after replace')\n"
+            "            os.kill(os.getpid(), getattr(signal, _action))\n"
             "        return result\n"
-            "    setattr(os, _kind, _wrapped)\n")
+            "    setattr(_owner, _kind, _wrapped)\n")
         return {**env, "PYTHONPATH": str(inject), "FLIPAUTH_TEST_INJECT": spec}
 
     def test_migrate_default_signal_after_a_move_rolls_back_completely(self):
@@ -672,6 +686,43 @@ class Accounts(unittest.TestCase):
         self.assertNotIn("rolled back", res.stderr)
         self._assert_migrated(target_dir)
         self.assertEqual(sorted(p.name for p in default_dir.iterdir()), ["packages"])
+
+    def test_migrate_default_signal_while_registry_is_staged_aborts_before_commit(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        target_dir = self.home / ".codex-sen"
+        before = self._migration_snapshot(default_dir)
+        hit = self._signal_injection_env(env, "mkstemp:.accounts-:SIGINT")
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=hit, ok=False)
+        self.assertIn("rolled back, nothing changed", res.stderr)
+        self.assertNotIn("migration is complete", res.stderr)
+        self.assertFalse(target_dir.exists())
+        self.assertEqual(self._migration_snapshot(default_dir), before)
+        self.assertEqual([p.name for p in (self.root / "registry").glob(".accounts-*")], [])
+        self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self._assert_migrated(target_dir)
+
+    def test_migrate_default_failure_after_replace_never_rolls_back_a_commit(self):
+        registry_dir = self.root / "registry"
+        accounts = registry_dir / "accounts.json"
+        for action in ("raise-file", "raise-dir"):
+            with self.subTest(action):
+                default_dir, daemon, env = self._codex_default_with_daemon()
+                target_dir = self.home / ".codex-sen"
+                try:
+                    hit = self._signal_injection_env(env, f"replace:accounts.json:{action}")
+                    res = self.call("codex", "migrate-default", "sen", target_dir, env=hit, ok=False)
+                    self.assertNotIn("rolled back, nothing changed", res.stderr)
+                    expected = "nothing rolled back" if action == "raise-file" else "UNKNOWN"
+                    self.assertIn(expected, res.stderr)
+                    registry_dir.chmod(0o700)
+                    accounts.chmod(0o600)
+                    # Files stayed with the committed registry, which names the new home.
+                    self._assert_migrated(target_dir)
+                    self.assertEqual(sorted(p.name for p in default_dir.iterdir()), ["packages"])
+                finally:
+                    subprocess.run(["chmod", "-R", "u+rwx", str(self.root)], check=True)
+                    subprocess.run(["rm", "-rf", str(default_dir), str(target_dir), str(registry_dir)],
+                                   check=True)
 
     def test_migrate_default_symlinked_default_home_rewrites_literal_links(self):
         default_dir, daemon, env = self._codex_default_with_daemon(real_name="codex-real")

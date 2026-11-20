@@ -133,12 +133,21 @@ def registry_writer(root):
         yield load_registry(root)
 
 
-def write_registry(root, data):
+def write_registry(root, data, before_commit=None):
+    """Atomically replace accounts.json.
+
+    ``before_commit(staged_inode)`` runs after the new content is fully written and
+    immediately before the replace; it may raise to abort without committing.
+    """
     fd, tmp = tempfile.mkstemp(prefix=".accounts-", dir=root)
     try:
         with os.fdopen(fd, "w") as out:
             json.dump(data, out, indent=2, sort_keys=True)
             out.write("\n")
+            out.flush()
+            staged_inode = os.fstat(out.fileno()).st_ino
+        if before_commit:
+            before_commit(staged_inode)
         os.replace(tmp, root / "accounts.json")
     finally:
         if os.path.exists(tmp):
@@ -598,13 +607,6 @@ def _deferred_signals():
             signal.signal(number, handler)
 
 
-def _registry_directory(root, service, account_name):
-    try:
-        return load_registry(root)["accounts"][service][account_name]["directory"]
-    except (Refused, OSError, ValueError, KeyError, TypeError):
-        return None
-
-
 def _rollback(journal):
     """Undo journalled steps in reverse; return the steps that could not be undone."""
     failed = []
@@ -688,19 +690,38 @@ def migrate_default(service, root, args):
                       f"rewriting {len(links)} daemon symlink(s)) "
                       f"and update {service}/{args.name} in registry")
                 return
-            # Every step is journalled; any failure before the registry commit undoes
-            # the journal so a rerun starts from scratch. Interrupting signals are
-            # only recorded while files move, so no signal lands between a step and
-            # its journal entry: one arriving before the commit aborts at the next
-            # step boundary and rolls back; one arriving after it lets the
-            # completed migration report, then exits with the signal status.
+            # Every step is journalled; any failure known to precede the registry
+            # commit undoes the journal so a rerun starts from scratch. Interrupting
+            # signals are only recorded while files move, so no signal lands between
+            # a step and its journal entry. The last abort check runs right before
+            # the atomic registry replace (the commit point): a signal recorded by
+            # then rolls back; a later one lets the completed migration report and
+            # then exits with the signal status. If a failure leaves it unclear
+            # whether the replace happened, nothing is rolled back.
             journal = []
+            commit = {"staged_inode": None}
             with _deferred_signals() as caught:
 
                 def record(step):
                     journal.append(step)
+                    abort_if_signalled()
+
+                def abort_if_signalled():
                     if caught:
                         raise InterruptedError(f"interrupted by signal {caught[0]}")
+
+                def before_commit(staged_inode):
+                    abort_if_signalled()
+                    commit["staged_inode"] = staged_inode
+
+                def commit_state():
+                    if commit["staged_inode"] is None:
+                        return "not-committed"
+                    try:
+                        current = os.stat(root / "accounts.json").st_ino
+                    except OSError:
+                        return "unknown"
+                    return "committed" if current == commit["staged_inode"] else "not-committed"
 
                 try:
                     new_dir.mkdir(mode=0o700)
@@ -727,12 +748,17 @@ def migrate_default(service, root, args):
                             if got != want or not (new_daemon / relative).exists():
                                 raise OSError(f"daemon symlink {relative} resolves to {got}, expected {want}")
                     entry["directory"] = str(new_dir)
-                    write_registry(root, data)
+                    write_registry(root, data, before_commit=before_commit)
                 except BaseException as error:
-                    if _registry_directory(root, service, args.name) == str(new_dir):
+                    state = commit_state()
+                    if state == "committed":
                         # The atomic registry replace already happened: keep the moved state.
                         refuse(f"migration committed to the registry but then reported {error}; "
                                f"{service}/{args.name} now lives in {new_dir}; nothing rolled back")
+                    if state == "unknown":
+                        refuse(f"migration failed at the registry commit ({error}) and the registry cannot "
+                               f"be checked; commit state UNKNOWN, so nothing was rolled back: moved entries "
+                               f"are in {new_dir}; inspect {root / 'accounts.json'} before any rerun")
                     entry["directory"] = str(default_home)
                     failed = _rollback(journal)
                     if failed:
@@ -746,8 +772,8 @@ def migrate_default(service, root, args):
                       f"kept_in_default={','.join(kept) or 'none'}, "
                       f"default_{credential}={'present' if still_present else 'absent'})", flush=True)
                 if caught:
-                    print(f"flipauth: signal {caught[0]} arrived after the registry commit; "
-                          "migration is complete", file=sys.stderr, flush=True)
+                    print(f"flipauth: signal {caught[0]} arrived after the last abort check before the "
+                          "registry commit; migration is complete", file=sys.stderr, flush=True)
                     raise SystemExit(128 + caught[0])
 
 
