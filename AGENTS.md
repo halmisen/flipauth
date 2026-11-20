@@ -76,7 +76,8 @@ OAuth without an API key uses state outside the config home and is unsupported.
   `packages/standalone` in `~/.codex` so standalone symlinks remain valid while leaving
   `~/.codex` without `auth.json` (Fail-Closed). The per-home `packages/app-server-daemon`
   moves with the account and its absolute `current` symlink is repointed into the new home;
-  unknown packages or daemon symlinks elsewhere into the old home refuse before moving.
+  unknown packages, unsafe/uncheckable daemon symlinks or unwritable directories refuse before
+  moving. Any later failure (including the registry write) rolls back every journalled step.
   No cross-account conversation resume or relaunch in old panes.
 - Bindings use one generator and one official executable resolver. PATH discovery
   skips FlipAuth wrappers; binding records the stable official entry in the registry.

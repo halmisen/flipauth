@@ -492,9 +492,15 @@ class Accounts(unittest.TestCase):
         # Running again fails because sen is no longer in default home.
         self.call("codex", "migrate-default", "sen", self.home / ".codex-sen2", env=env, ok=False)
 
-    def _codex_default_with_daemon(self):
+    def _codex_default_with_daemon(self, real_name=None):
+        # real_name: ~/.codex is a symlink to that directory, while official links
+        # keep the literal ~/.codex spelling.
         default_dir = self.home / ".codex"
-        default_dir.mkdir(mode=0o700)
+        if real_name:
+            (self.home / real_name).mkdir(mode=0o700)
+            default_dir.symlink_to(self.home / real_name)
+        else:
+            default_dir.mkdir(mode=0o700)
         (default_dir / "auth.json").write_text("SECRET-NEVER-READ")
         (default_dir / "app-server-daemon").mkdir(mode=0o700)
         (default_dir / "app-server-daemon" / "server.pid").write_text("{}\n")
@@ -556,6 +562,105 @@ class Accounts(unittest.TestCase):
         self.assertIn("unknown Codex packages", res.stderr)
         self.assertFalse(target_dir.exists())
         self.assertTrue((default_dir / "auth.json").is_file())
+
+    def _migration_snapshot(self, default_dir):
+        daemon = default_dir / "packages" / "app-server-daemon"
+        return (sorted(p.name for p in default_dir.iterdir()),
+                sorted(str(p.relative_to(daemon)) for p in daemon.rglob("*")),
+                os.readlink(daemon / "current"),
+                (default_dir / "auth.json").read_text(),
+                (self.root / "registry/accounts.json").read_text())
+
+    def _assert_migrated(self, target_dir):
+        new_daemon = target_dir / "packages" / "app-server-daemon"
+        self.assertTrue((new_daemon / "current" / "bin" / "codex").is_file())
+        self.assertTrue(str(Path(os.path.realpath(new_daemon / "current"))).startswith(str(target_dir)))
+        self.assertEqual((target_dir / "auth.json").read_text(), "SECRET-NEVER-READ")
+        registry = json.loads((self.root / "registry/accounts.json").read_text())
+        self.assertEqual(registry["accounts"]["codex"]["sen"]["directory"], str(target_dir))
+
+    def test_migrate_default_unwritable_old_packages_moves_nothing_and_rerun_succeeds(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        target_dir = self.home / ".codex-sen"
+        before = self._migration_snapshot(default_dir)
+        packages = default_dir / "packages"
+        packages.chmod(0o500)
+        self.addCleanup(packages.chmod, 0o700)
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=env, ok=False)
+        self.assertIn("nothing", res.stderr)
+        self.assertFalse(target_dir.exists())
+        self.assertEqual(self._migration_snapshot(default_dir), before)
+        packages.chmod(0o700)
+        self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self._assert_migrated(target_dir)
+
+    def test_migrate_default_ignores_a_preexisting_staging_name(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        (daemon / "current.flipauth-tmp").write_text("not ours\n")
+        target_dir = self.home / ".codex-sen"
+        self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self._assert_migrated(target_dir)
+        new_daemon = target_dir / "packages" / "app-server-daemon"
+        self.assertEqual((new_daemon / "current.flipauth-tmp").read_text(), "not ours\n")
+        self.assertEqual([p.name for p in new_daemon.iterdir() if ".flipauth-" in p.name and p.name.startswith(".")], [])
+
+    def test_migrate_default_registry_write_failure_rolls_back_every_move(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        target_dir = self.home / ".codex-sen"
+        # Dry-run creates the lock files, so only the atomic registry write fails.
+        self.call("codex", "migrate-default", "sen", target_dir, "--dry-run", env=env)
+        before = self._migration_snapshot(default_dir)
+        registry_dir = self.root / "registry"
+        registry_dir.chmod(0o500)
+        self.addCleanup(registry_dir.chmod, 0o700)
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=env, ok=False)
+        self.assertIn("rolled back, nothing changed", res.stderr)
+        self.assertFalse(target_dir.exists())
+        self.assertEqual(self._migration_snapshot(default_dir), before)
+        registry_dir.chmod(0o700)
+        self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self._assert_migrated(target_dir)
+
+    def test_migrate_default_symlinked_default_home_rewrites_literal_links(self):
+        default_dir, daemon, env = self._codex_default_with_daemon(real_name="codex-real")
+        self.assertTrue(os.readlink(default_dir / "packages/app-server-daemon/current").startswith(str(default_dir) + "/"))
+        target_dir = self.home / ".codex-sen"
+        self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self._assert_migrated(target_dir)
+        self.assertEqual(sorted(p.name for p in (default_dir / "packages").iterdir()), ["standalone"])
+
+    def test_migrate_default_refuses_daemon_links_it_cannot_carry(self):
+        target_dir = self.home / ".codex-sen"
+        cases = {
+            "absolute-root": lambda d, home: (d / "root-link").symlink_to(home),
+            "relative-escape": lambda d, home: (d / "rel-link").symlink_to("../standalone"),
+        }
+        def unreadable_subdir(d, home):
+            # A link inside an unreadable subdirectory cannot be checked.
+            locked = d / "releases" / "locked"
+            locked.mkdir()
+            (locked / "abs").symlink_to(home / "packages" / "standalone")
+            locked.chmod(0o000)
+
+        cases = {
+            "absolute-root": lambda d, home: (d / "root-link").symlink_to(home),
+            "relative-escape": lambda d, home: (d / "rel-link").symlink_to("../standalone"),
+            "unreadable-subdir": unreadable_subdir,
+        }
+        for label, plant in cases.items():
+            with self.subTest(label):
+                default_dir, daemon, env = self._codex_default_with_daemon()
+                try:
+                    plant(daemon, default_dir)
+                    res = self.call("codex", "migrate-default", "sen", target_dir, env=env, ok=False)
+                    self.assertIn("nothing moved", res.stderr)
+                    self.assertFalse(target_dir.exists())
+                    self.assertTrue((default_dir / "auth.json").is_file())
+                    self.assertTrue((daemon / "current" / "bin" / "codex").is_file())
+                finally:
+                    subprocess.run(["chmod", "-R", "u+rwx", str(self.home)], check=True)
+                    subprocess.run(["rm", "-rf", str(default_dir), str(target_dir),
+                                    str(self.root / "registry")], check=True)
 
     def test_deploy_current_script_installs_checks_and_migrates_legacy_wrapper(self):
         first = self.create("codex", "primary")

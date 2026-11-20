@@ -201,13 +201,23 @@ flipauth codex account migrate-default primary "$HOME/.codex-primary"
 ```
 
 `migrate-default` verifies zero same-service processes are running in the default home,
-atomically moves account state without reading credentials, updates `accounts.json`, and
-(for Codex) keeps only `~/.codex/packages/standalone` in place so standalone symlinks such as
-`~/.local/bin/codex` remain intact while `~/.codex` has no `auth.json`. The per-home
-`packages/app-server-daemon` moves with the account, and its absolute `current` symlink is
-repointed at the same release under the new home; otherwise Codex reports the daemon
-executable missing. Unknown package kinds, or daemon symlinks pointing elsewhere in the old
-home, refuse before anything moves.
+moves account state with same-filesystem renames without reading credentials, updates
+`accounts.json`, and (for Codex) keeps only `~/.codex/packages/standalone` in place so
+standalone symlinks such as `~/.local/bin/codex` remain intact while `~/.codex` has no
+`auth.json`. The per-home `packages/app-server-daemon` moves with the account, and its
+absolute `current` symlink is repointed at the same release under the new home (matching
+both the literal `~/.codex` spelling and its resolved path); otherwise Codex reports the
+daemon executable missing.
+
+The migration is all-or-nothing. Before anything moves it refuses on: unwritable source,
+target or daemon directories; unknown package kinds; daemon symlinks that leave the daemon
+package (absolute links into the old home, relative links such as `../standalone`); and
+daemon subdirectories it cannot read. Every rename and symlink rewrite is journalled; if a
+later step fails (including the final registry write, or a moved link that no longer
+resolves where expected) the journal is undone in reverse and the command reports
+`rolled back, nothing changed`, so fixing the cause and rerunning starts cleanly. Only if
+the rollback itself fails does it report `rollback is INCOMPLETE` with the steps to restore
+by hand; the registry still points at the default home in that case.
 
 Binding records the stable official executable in the registry for every entrypoint.
 It does not write a release-number path into the wrapper. PATH discovery skips FlipAuth
@@ -284,7 +294,7 @@ FlipAuth 为每个账号指定独立目录，启动原生 Claude Code 或 Codex�
 Codex 先发 `Esc` 中断，再发 `Ctrl+C` 退出）；若目标账号已是当前选中且场上仍有异号进程，
 默认预检拒绝而不停任何进程，可用裸命令 / `account run` 直接加开或显式传 `--replace` 清场。
 `bind-current` 必须放在独立优先目录（如 `~/.local/flipauth/bin/`），禁止写入官方二进制或官方软链目录以防升级覆写；
-`account migrate-default <name> <new-dir>` 可在默认目录无进程运行时将默认目录账号迁至独立目录（Codex 只保留 `~/.codex/packages/standalone` 不断链；按 home 分装的 `packages/app-server-daemon` 随账号迁走，其绝对软链 `current` 改指新目录下同一 release；遇未知包类型或指向旧目录其他位置的 daemon 软链则迁移前拒绝），使默认目录无 `auth.json` 实现 Fail-Closed。
+`account migrate-default <name> <new-dir>` 可在默认目录无进程运行时将默认目录账号迁至独立目录（Codex 只保留 `~/.codex/packages/standalone` 不断链；按 home 分装的 `packages/app-server-daemon` 随账号迁走，其绝对软链 `current` 改指新目录下同一 release；遇未知包类型或指向旧目录其他位置的 daemon 软链则迁移前拒绝），使默认目录无 `auth.json` 实现 Fail-Closed。迁移全有或全无：移动前预检源/目标/daemon 目录可写、daemon 软链不越出 daemon 包（含指向旧目录根的绝对链、`../standalone` 类相对链）、子目录可读，否则拒绝且零移动；移动中任一步（含最后的注册表写入、迁后软链解析校验）失败即按日志逆序回滚并报 `rolled back, nothing changed`，修复原因后可直接重跑；仅回滚本身失败时报 `rollback is INCOMPLETE` 并列出手工恢复步骤，此时注册表仍指向默认目录。
 `status` 分别显示启动选择和实际进程目录，不把账号标签当成真实身份验证。
 不使用网关，不复制凭据，不查询配额，不自动安装 PATH 包装或修改已有登录。
 

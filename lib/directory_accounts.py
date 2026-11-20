@@ -496,11 +496,17 @@ def _codex_packages_plan(default_home):
     into the old daemon package are rewritten to the same relative target under
     the new home. Anything else (unknown packages, symlinks escaping the daemon
     package into the old home) refuses before a file moves.
-    Returns ``(daemon_dir or None, [(link_relpath, target_relpath)], kept_names)``.
+    The old home is matched both by its literal ``~/.codex`` spelling and by its
+    resolved path, because official installs write absolute links with the
+    literal spelling even when ``~/.codex`` is itself a symlink.
+    Returns ``(daemon_dir or None, rewrites, checks, kept_names)`` where
+    ``rewrites`` is ``[(link_relpath, target_relpath)]`` and ``checks`` records,
+    for every resolvable link, where it must resolve after the move.
     """
+    homes = {default_home, Path(os.path.normpath(Path.home() / ".codex"))}
     packages = default_home / "packages"
     if not packages.exists() and not packages.is_symlink():
-        return None, [], []
+        return None, [], [], []
     if packages.is_symlink() or not packages.is_dir():
         refuse(f"{packages} is not a plain directory; nothing moved")
     names = sorted(p.name for p in packages.iterdir())
@@ -511,29 +517,83 @@ def _codex_packages_plan(default_home):
     kept = [n for n in names if n != CODEX_DAEMON_PACKAGE]
     daemon = packages / CODEX_DAEMON_PACKAGE
     if CODEX_DAEMON_PACKAGE not in names:
-        return None, [], kept
+        return None, [], [], kept
     if daemon.is_symlink() or not daemon.is_dir():
         refuse(f"{daemon} is not a plain directory; nothing moved")
-    links = []
-    old_prefix = os.path.join(str(default_home), "")
-    for folder, dirs, files in os.walk(daemon):
+    real_daemon = daemon.resolve()
+    daemons = {home / "packages" / CODEX_DAEMON_PACKAGE for home in homes} | {real_daemon}
+
+    def unreadable(error):
+        refuse(f"cannot inspect {error.filename} ({error.strerror}); "
+               "daemon package symlinks must all be checked; nothing moved")
+
+    rewrites, checks = [], []
+    for folder, dirs, files in os.walk(daemon, onerror=unreadable):
         for name_ in dirs + files:
             path = Path(folder) / name_
             if not path.is_symlink():
                 continue
+            relative = path.relative_to(daemon)
             target = os.readlink(path)
-            if not os.path.isabs(target):
+            lexical = Path(os.path.normpath(target if os.path.isabs(target) else Path(folder) / target))
+            real = Path(os.path.realpath(path))
+            inside = next((lexical.relative_to(base) for base in daemons if _within(lexical, base)), None)
+            unsafe = f"daemon package symlink {relative} -> {target} "
+            if inside is None:
+                # Leaves the moved tree: only an absolute link to somewhere outside
+                # the old home keeps working unchanged after the move.
+                if (not os.path.isabs(target) or any(_within(lexical, home) for home in homes)
+                        or _within(real, default_home)):
+                    refuse(unsafe + "leaves the daemon package; cannot rewrite safely; nothing moved")
+                if path.exists():
+                    checks.append((relative, None, real))
                 continue
-            normalized = os.path.normpath(target)
-            try:
-                inside = Path(normalized).relative_to(daemon)
-            except ValueError:
-                if normalized.startswith(old_prefix):
-                    refuse(f"daemon package symlink {path} points elsewhere in {default_home}; "
-                           "cannot rewrite safely; nothing moved")
-                continue
-            links.append((path.relative_to(daemon), inside))
-    return daemon, links, kept
+            if path.exists():
+                if not _within(real, real_daemon):
+                    refuse(unsafe + "resolves outside the daemon package; cannot rewrite safely; nothing moved")
+                checks.append((relative, real.relative_to(real_daemon), None))
+            if os.path.isabs(target):
+                rewrites.append((relative, inside))
+    return daemon, rewrites, checks, kept
+
+
+def _within(path, base):
+    return path == base or base in path.parents
+
+
+def _replace_symlink(link, target):
+    """Atomically point ``link`` at ``target`` through a fresh staging name."""
+    for _ in range(100):
+        staging = link.with_name(f".{link.name}.flipauth-{os.urandom(4).hex()}")
+        try:
+            os.symlink(target, staging)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise OSError(f"no free staging name next to {link}")
+    try:
+        os.replace(staging, link)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(staging)
+        raise
+
+
+def _rollback(journal):
+    """Undo journalled steps in reverse; return the steps that could not be undone."""
+    failed = []
+    for step in reversed(journal):
+        try:
+            if step[0] == "mkdir":
+                step[1].rmdir()
+            elif step[0] == "rename":
+                os.rename(step[2], step[1])
+            elif step[0] == "relink":
+                _replace_symlink(step[1], step[2])
+        except OSError as error:
+            failed.append(f"{step[0]} {' -> '.join(map(str, step[1:]))}: {error}")
+    return failed
 
 
 def migrate_default(service, root, args):
@@ -580,12 +640,22 @@ def migrate_default(service, root, args):
             if busy:
                 refuse(f"cannot migrate {default_home} while {service} processes are using it "
                        f"({'; '.join(busy)}); stop them first; nothing moved")
-            daemon, links, kept_packages = (_codex_packages_plan(default_home)
-                                            if service == "codex" else (None, [], []))
+            daemon, links, checks, kept_packages = (_codex_packages_plan(default_home)
+                                                    if service == "codex" else (None, [], [], []))
             items = sorted(p.name for p in default_home.iterdir())
             to_move = [item for item in items if not (service == "codex" and item == "packages")]
             moved = to_move + ([f"packages/{CODEX_DAEMON_PACKAGE}"] if daemon else [])
             kept = [f"packages/{item}" for item in kept_packages]
+            # A directory changing parent also rewrites its own ".." entry.
+            writable = [default_home, new_dir.parent]
+            writable += [default_home / item for item in to_move
+                         if (default_home / item).is_dir() and not (default_home / item).is_symlink()]
+            if daemon:
+                writable += [daemon.parent, daemon]
+                writable += [daemon / relative.parent for relative, _ in links]
+            blocked = sorted({str(path) for path in writable if not os.access(path, os.W_OK | os.X_OK)})
+            if blocked:
+                refuse(f"not writable: {', '.join(blocked)}; nothing moved")
             if args.dry_run:
                 print(f"dry-run: would move {len(moved)} entries from {default_home} to {new_dir} "
                       f"(moving {', '.join(p for p in moved if p.startswith('packages/')) or 'no packages'}; "
@@ -593,21 +663,42 @@ def migrate_default(service, root, args):
                       f"rewriting {len(links)} daemon symlink(s)) "
                       f"and update {service}/{args.name} in registry")
                 return
-            new_dir.mkdir(mode=0o700)
-            for item in to_move:
-                os.rename(default_home / item, new_dir / item)
-            if daemon:
-                new_packages = new_dir / "packages"
-                new_packages.mkdir(mode=0o700)
-                new_daemon = new_packages / CODEX_DAEMON_PACKAGE
-                os.rename(daemon, new_daemon)
-                for relative, inside in links:
-                    link = new_daemon / relative
-                    staging = link.with_name(link.name + ".flipauth-tmp")
-                    os.symlink(new_daemon / inside, staging)
-                    os.replace(staging, link)
-            entry["directory"] = str(new_dir)
-            write_registry(root, data)
+            # Every step is journalled; any failure (including the registry write,
+            # which is last) undoes the journal so a rerun starts from scratch.
+            journal = []
+            try:
+                new_dir.mkdir(mode=0o700)
+                journal.append(("mkdir", new_dir))
+                for item in to_move:
+                    os.rename(default_home / item, new_dir / item)
+                    journal.append(("rename", default_home / item, new_dir / item))
+                if daemon:
+                    new_packages = new_dir / "packages"
+                    new_packages.mkdir(mode=0o700)
+                    journal.append(("mkdir", new_packages))
+                    new_daemon = new_packages / CODEX_DAEMON_PACKAGE
+                    os.rename(daemon, new_daemon)
+                    journal.append(("rename", daemon, new_daemon))
+                    for relative, inside in links:
+                        link = new_daemon / relative
+                        old_target = os.readlink(link)
+                        _replace_symlink(link, new_daemon / inside)
+                        journal.append(("relink", link, old_target))
+                    real_new = new_daemon.resolve()
+                    for relative, inside, outside in checks:
+                        want = real_new / inside if inside is not None else outside
+                        got = Path(os.path.realpath(new_daemon / relative))
+                        if got != want or not (new_daemon / relative).exists():
+                            raise OSError(f"daemon symlink {relative} resolves to {got}, expected {want}")
+                entry["directory"] = str(new_dir)
+                write_registry(root, data)
+            except BaseException as error:
+                entry["directory"] = str(default_home)
+                failed = _rollback(journal)
+                if failed:
+                    refuse(f"migration failed ({error}) and rollback is INCOMPLETE; registry still points "
+                           f"to {default_home}; restore by hand: {'; '.join(failed)}")
+                refuse(f"migration failed ({error}); rolled back, nothing changed; fix the cause and rerun")
     credential = "auth.json" if service == "codex" else ".credentials.json"
     still_present = (default_home / credential).exists()
     print(f"migrated {service} {args.name}: {default_home} -> {new_dir} "
