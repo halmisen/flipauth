@@ -492,6 +492,71 @@ class Accounts(unittest.TestCase):
         # Running again fails because sen is no longer in default home.
         self.call("codex", "migrate-default", "sen", self.home / ".codex-sen2", env=env, ok=False)
 
+    def _codex_default_with_daemon(self):
+        default_dir = self.home / ".codex"
+        default_dir.mkdir(mode=0o700)
+        (default_dir / "auth.json").write_text("SECRET-NEVER-READ")
+        (default_dir / "app-server-daemon").mkdir(mode=0o700)
+        (default_dir / "app-server-daemon" / "server.pid").write_text("{}\n")
+        packages = default_dir / "packages"
+        (packages / "standalone" / "current" / "bin").mkdir(parents=True)
+        (packages / "standalone" / "current" / "bin" / "codex").write_text("#!/bin/sh\nexit 0\n")
+        daemon = packages / "app-server-daemon"
+        release = daemon / "releases" / "0.170.0-x86_64-unknown-linux-musl"
+        (release / "bin").mkdir(parents=True)
+        (release / "bin" / "codex").write_text("#!/bin/sh\nexit 0\n")
+        (release / "codex").symlink_to("bin/codex")
+        (daemon / "current").symlink_to(release)  # absolute, like official installs
+        (daemon / "selection-history").write_text("0.170.0-x86_64-unknown-linux-musl\n")
+        (daemon / "auto-update-version").write_text("0.170.0-x86_64-unknown-linux-musl\n")
+        empty_ps = self.root / "empty-ps"
+        empty_ps.write_text("#!/bin/sh\nexit 0\n")
+        empty_ps.chmod(0o700)
+        env = {**self.env, "FLIPAUTH_PS_BIN": str(empty_ps)}
+        self.call("codex", "add", "sen", default_dir, "--default", env=env)
+        return default_dir, daemon, env
+
+    def test_migrate_default_moves_daemon_package_and_keeps_only_standalone(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        target_dir = self.home / ".codex-sen"
+
+        dry = self.call("codex", "migrate-default", "sen", target_dir, "--dry-run", env=env)
+        self.assertIn("moving packages/app-server-daemon", dry.stdout)
+        self.assertIn("keeping packages/standalone", dry.stdout)
+        self.assertFalse(target_dir.exists())
+        self.assertTrue(daemon.is_dir())
+
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=env)
+        self.assertIn("kept_in_default=packages/standalone", res.stdout)
+        self.assertEqual(sorted(p.name for p in (default_dir / "packages").iterdir()), ["standalone"])
+        self.assertEqual(sorted(p.name for p in default_dir.iterdir()), ["packages"])
+        new_daemon = target_dir / "packages" / "app-server-daemon"
+        release = new_daemon / "releases" / "0.170.0-x86_64-unknown-linux-musl"
+        self.assertEqual(os.readlink(new_daemon / "current"), str(release))
+        self.assertTrue((new_daemon / "current" / "bin" / "codex").is_file())
+        self.assertEqual(os.readlink(release / "codex"), "bin/codex")
+        self.assertEqual((new_daemon / "selection-history").read_text(), "0.170.0-x86_64-unknown-linux-musl\n")
+        self.assertTrue((new_daemon / "auto-update-version").is_file())
+        self.assertTrue((target_dir / "app-server-daemon" / "server.pid").is_file())
+        self.assertEqual((target_dir / "auth.json").read_text(), "SECRET-NEVER-READ")
+
+    def test_migrate_default_refuses_unsafe_codex_packages_before_moving(self):
+        default_dir, daemon, env = self._codex_default_with_daemon()
+        target_dir = self.home / ".codex-sen"
+        # A daemon symlink escaping into another part of the old home cannot be rewritten safely.
+        (daemon / "stray").symlink_to(default_dir / "packages" / "standalone")
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=env, ok=False)
+        self.assertIn("cannot rewrite safely", res.stderr)
+        self.assertFalse(target_dir.exists())
+        self.assertTrue((default_dir / "auth.json").is_file())
+        (daemon / "stray").unlink()
+        # Unknown package kinds: ownership unknown, so refuse rather than guess.
+        (default_dir / "packages" / "mystery").mkdir()
+        res = self.call("codex", "migrate-default", "sen", target_dir, env=env, ok=False)
+        self.assertIn("unknown Codex packages", res.stderr)
+        self.assertFalse(target_dir.exists())
+        self.assertTrue((default_dir / "auth.json").is_file())
+
     def test_deploy_current_script_installs_checks_and_migrates_legacy_wrapper(self):
         first = self.create("codex", "primary")
         self.call("codex", "add", "primary", first, "--default")

@@ -482,11 +482,67 @@ def bind_launcher(service, script, root, value, label=None, switch=False, check=
     print(f"{'already bound' if existed else 'bound'}: {target}")
 
 
+CODEX_STANDALONE_PACKAGE = "standalone"
+CODEX_DAEMON_PACKAGE = "app-server-daemon"
+
+
+def _codex_packages_plan(default_home):
+    """Preflight ``~/.codex/packages`` without changing it.
+
+    ``standalone`` stays because ``~/.local/bin/codex`` and the registry's stable
+    entry point into it. ``app-server-daemon`` is installed per home: Codex looks
+    for ``<home>/packages/app-server-daemon/current/bin/codex`` next to the daemon
+    state, so it moves with the account. Absolute symlinks inside it that point
+    into the old daemon package are rewritten to the same relative target under
+    the new home. Anything else (unknown packages, symlinks escaping the daemon
+    package into the old home) refuses before a file moves.
+    Returns ``(daemon_dir or None, [(link_relpath, target_relpath)], kept_names)``.
+    """
+    packages = default_home / "packages"
+    if not packages.exists() and not packages.is_symlink():
+        return None, [], []
+    if packages.is_symlink() or not packages.is_dir():
+        refuse(f"{packages} is not a plain directory; nothing moved")
+    names = sorted(p.name for p in packages.iterdir())
+    unknown = [n for n in names if n not in {CODEX_STANDALONE_PACKAGE, CODEX_DAEMON_PACKAGE}]
+    if unknown:
+        refuse(f"unknown Codex packages in {packages}: {', '.join(unknown)}; "
+               "cannot tell whether they belong to the account or the install; nothing moved")
+    kept = [n for n in names if n != CODEX_DAEMON_PACKAGE]
+    daemon = packages / CODEX_DAEMON_PACKAGE
+    if CODEX_DAEMON_PACKAGE not in names:
+        return None, [], kept
+    if daemon.is_symlink() or not daemon.is_dir():
+        refuse(f"{daemon} is not a plain directory; nothing moved")
+    links = []
+    old_prefix = os.path.join(str(default_home), "")
+    for folder, dirs, files in os.walk(daemon):
+        for name_ in dirs + files:
+            path = Path(folder) / name_
+            if not path.is_symlink():
+                continue
+            target = os.readlink(path)
+            if not os.path.isabs(target):
+                continue
+            normalized = os.path.normpath(target)
+            try:
+                inside = Path(normalized).relative_to(daemon)
+            except ValueError:
+                if normalized.startswith(old_prefix):
+                    refuse(f"daemon package symlink {path} points elsewhere in {default_home}; "
+                           "cannot rewrite safely; nothing moved")
+                continue
+            links.append((path.relative_to(daemon), inside))
+    return daemon, links, kept
+
+
 def migrate_default(service, root, args):
     """Move a registered default-home account to a dedicated directory for Fail-Closed isolation.
 
-    For Codex, ``packages/`` stays in ``~/.codex`` so standalone symlinks
-    (``~/.local/bin/codex`` and ``~/.codex/packages/standalone/current``) remain intact.
+    For Codex, only ``packages/standalone`` stays in ``~/.codex`` so the standalone
+    symlinks (``~/.local/bin/codex`` and ``packages/standalone/current``) remain
+    intact; the per-home ``packages/app-server-daemon`` moves with the account and
+    its absolute ``current`` symlink is repointed at the same release in the new home.
     Refuses if any same-service process is running in the default home.
     Never reads credential contents.
     """
@@ -524,24 +580,38 @@ def migrate_default(service, root, args):
             if busy:
                 refuse(f"cannot migrate {default_home} while {service} processes are using it "
                        f"({'; '.join(busy)}); stop them first; nothing moved")
-            preserve = {"packages"} if service == "codex" else set()
+            daemon, links, kept_packages = (_codex_packages_plan(default_home)
+                                            if service == "codex" else (None, [], []))
             items = sorted(p.name for p in default_home.iterdir())
-            to_move = [item for item in items if item not in preserve]
-            kept = [item for item in items if item in preserve]
+            to_move = [item for item in items if not (service == "codex" and item == "packages")]
+            moved = to_move + ([f"packages/{CODEX_DAEMON_PACKAGE}"] if daemon else [])
+            kept = [f"packages/{item}" for item in kept_packages]
             if args.dry_run:
-                print(f"dry-run: would move {len(to_move)} entries from {default_home} to {new_dir} "
-                      f"(keeping {', '.join(kept) or 'none'} in {default_home}) "
+                print(f"dry-run: would move {len(moved)} entries from {default_home} to {new_dir} "
+                      f"(moving {', '.join(p for p in moved if p.startswith('packages/')) or 'no packages'}; "
+                      f"keeping {', '.join(kept) or 'none'} in {default_home}; "
+                      f"rewriting {len(links)} daemon symlink(s)) "
                       f"and update {service}/{args.name} in registry")
                 return
             new_dir.mkdir(mode=0o700)
             for item in to_move:
                 os.rename(default_home / item, new_dir / item)
+            if daemon:
+                new_packages = new_dir / "packages"
+                new_packages.mkdir(mode=0o700)
+                new_daemon = new_packages / CODEX_DAEMON_PACKAGE
+                os.rename(daemon, new_daemon)
+                for relative, inside in links:
+                    link = new_daemon / relative
+                    staging = link.with_name(link.name + ".flipauth-tmp")
+                    os.symlink(new_daemon / inside, staging)
+                    os.replace(staging, link)
             entry["directory"] = str(new_dir)
             write_registry(root, data)
     credential = "auth.json" if service == "codex" else ".credentials.json"
     still_present = (default_home / credential).exists()
     print(f"migrated {service} {args.name}: {default_home} -> {new_dir} "
-          f"(moved={len(to_move)}, kept_in_default={','.join(kept) or 'none'}, "
+          f"(moved={len(moved)}, rewritten_links={len(links)}, kept_in_default={','.join(kept) or 'none'}, "
           f"default_{credential}={'present' if still_present else 'absent'})")
 
 

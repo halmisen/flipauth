@@ -72,9 +72,11 @@ OAuth without an API key uses state outside the config home and is unsupported.
   `bind-current` refuses to write into the official executable's directory or official
   symlink's directory so provider upgrades cannot overwrite it.
   `account migrate-default NAME NEW_DIR` safely moves a default-home account to a dedicated
-  directory after verifying zero processes run in the default home, keeping Codex `packages/`
-  in `~/.codex` so standalone symlinks remain valid while leaving `~/.codex` without `auth.json`
-  (Fail-Closed).
+  directory after verifying zero processes run in the default home, keeping only Codex
+  `packages/standalone` in `~/.codex` so standalone symlinks remain valid while leaving
+  `~/.codex` without `auth.json` (Fail-Closed). The per-home `packages/app-server-daemon`
+  moves with the account and its absolute `current` symlink is repointed into the new home;
+  unknown packages or daemon symlinks elsewhere into the old home refuse before moving.
   No cross-account conversation resume or relaunch in old panes.
 - Bindings use one generator and one official executable resolver. PATH discovery
   skips FlipAuth wrappers; binding records the stable official entry in the registry.

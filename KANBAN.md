@@ -26,7 +26,8 @@
 2026-11-19 落地三项第一性原理修复：
 1) `bind-current` 路径隔离：代码层禁止将 `bind-current` 写入官方二进制所在目录、官方软链所在目录或已存在的官方软链位置，报错引导至独立优先目录（如 `~/.local/flipauth/bin/<service>`）；
 2) 修正混号切换语义：`selected == target` 且场上存在异号进程时默认预检拒绝且不杀任何进程（列出异号 PID/账号/目录，提示用裸命令或 `account run <target>` 加开，或显式传 `--replace` 清场）；执行切换（`selected != target` 或 `--replace`）时仅停非目标账号 CLI 与 daemon（`home != target`），保留已运行的目标账号 CLI 与 daemon（回执记录 `kept_cli`/`kept_daemon`）；
-3) Fail-Closed 迁移准备：新增 `account migrate-default <name> <new-dir> [--dry-run]`（预检默认目录零进程后原子迁出账号文件，Codex 保留 `~/.codex/packages/` 以不断开 standalone 软链，迁后 `~/.codex` 无 `auth.json` 实现 Fail-Closed）；已在隔离临时 `HOME` 对真实 Codex `0.170.0` 实测验证，待实机 `~/.codex` 空闲后由用户手动执行迁出 `sen -> ~/.codex-sen`。
+3) Fail-Closed 迁移准备：新增 `account migrate-default <name> <new-dir> [--dry-run]`（预检默认目录零进程后原子迁出账号文件，Codex 只保留 `~/.codex/packages/standalone` 以不断开 standalone 软链，迁后 `~/.codex` 无 `auth.json` 实现 Fail-Closed）；已在隔离临时 `HOME` 对真实 Codex `0.170.0` 实测验证。
+2026-11-20 `workman` 实机迁出 `sen -> ~/.codex-sen` 后 `codex-sen` 报 `daemon executable not found`（daemon 状态已迁、`packages/app-server-daemon` 程序留在 `~/.codex`）；实机已手动移入 `~/.codex-sen/packages/` 并改指 `current`，此后切换、并开、裸 `codex` 跟随均通过。用户选方案 A，代码改为 `packages/app-server-daemon` 随账号迁走并重写其绝对 `current` 软链，未知包或越界软链迁移前拒绝（离线测试先红后绿）。
 4) 新增跨机幂等脚本 `scripts/deploy-current.sh [codex|claude|all] [--check]`：一键部署/核验 `~/.local/flipauth/bin/<service>`、`~/.bashrc`/`~/.profile` PATH 优先块，并在确认新包装器成功后把旧 `~/.local/bin/<service>` `# flipauth current launcher` 备份迁至 `~/.local/state/flipauth/launcher-backups/<timestamp>/`（不碰官方二进制/软链），便于 `workman` 与 `halmi-home` 统一核验/迁移。
 用户已授权代码、部署脚本及命名入口部署；本轮不实际停止会话、登录或迁移凭据。
 账号目录固定，官方 CLI 独占登录、刷新和请求；无网关、配额轮询或自动轮换。
