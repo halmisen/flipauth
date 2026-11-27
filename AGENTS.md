@@ -1,169 +1,63 @@
 # AGENTS.md
 
-Project rules for Claude Code, Codex and other coding agents. Read `KANBAN.md` next;
-it is the only short current-state panel. Provider overlays sit below this file.
+Project rules for coding agents working in FlipAuth. Read `KANBAN.md` next for current state.
 
 ## What This Is
 
-FlipAuth is an account-directory launcher for the official Claude Code and Codex CLIs
-on Windows WSL. It never handles token contents. The official client owns login,
-refresh and requests. There is no gateway, quota API, automatic rotation or daemon service.
-Runtime dependencies are Bash and Python 3.11+. No build or package installation is needed.
-Keep the checkout together when installing a symlink.
+FlipAuth is an account-directory launcher for official Claude Code and Codex CLIs on Windows WSL.
+It never reads or handles token contents; the official client owns login, refresh, and requests.
+No gateway, quota API, automatic rotation, or daemon service.
+Runtime: Bash and Python 3.11+. No build or package install; keep the checkout intact when symlinking.
 
-## Architecture
+## Module Map
 
-- `flipauth`: thin Bash entry, preserving invocation aliases.
-- `lib/cli.py`: public dispatch and explicit retirement of snapshot commands.
-- `lib/directory_accounts.py`: registry, home ownership, reviewed config, templates,
-  binding and launch-plan construction.
+- `flipauth`: thin Bash entry preserving invocation aliases.
+- `lib/cli.py`: public dispatch and refusal of retired snapshot routes.
+- `lib/directory_accounts.py`: registry, home ownership, reviewed config/templates, bindings, launch plans.
 - `lib/official_cli.py`: stable official executable discovery and `LaunchPlan`.
-- `lib/process_state.py`: same-user `/proc` facts and exact managed-daemon ownership.
-- `lib/short_commands.py`: current selection, status and terminal switch admission.
+- `lib/process_state.py`: same-user `/proc` inspection and exact managed-daemon ownership.
+- `lib/short_commands.py`: current selection, status, and terminal switch admission.
 - `lib/session_switch.py`: receipted CLI and managed-daemon shutdown.
 
-`LaunchPlan(service, account, home, executable, argv, env)` is the shared launch
-contract for explicit run, login, current selection and switching. It preserves
-cwd, PID, terminal, stdio, native arguments, signals and exit status through exec.
-Validate a resolved executable for the WSL boundary, but execute/persist its stable
-entry spelling. Never pin wrappers to a release-number path. Set `HERDR_AGENT` only
-on the launched child, not globally. A binary's install directory is not its account.
+## Core Invariants & Account Isolation
 
-`accounts.json` schema 1 stores canonical homes, configuration provenance, optional
-stable executable entries, current selection and the separately recorded initial
-default. It contains no credentials. Existing schema-1 registrations remain valid.
-Use the registry writer lock for read/modify/write; writes are atomic and private.
+- **Launch contract**: `LaunchPlan(service, account, home, executable, argv, env)` is the shared contract for run, login, current selection, and switching. Preserve cwd, PID, terminal, stdio, native args, signals, and exit status via `exec`. Validate resolved executables for the WSL boundary, but execute/persist stable entry spellings (never pin release-number paths). Set `HERDR_AGENT` only on the launched child. A binary's install dir is not its account.
+- **Registry**: `accounts.json` schema 1 stores canonical homes, config provenance, optional stable executable entries, current selection, and initial default (never credentials). Keep schema-1 compatibility. Use the registry writer lock for read/modify/write; writes must be atomic and private.
+- **Strict home isolation (Fail-Closed)**:
+  - Named homes cannot overlap across services, accounts, or the registry.
+  - Creation requires explicit `--bare` or a reviewed `--template`. Copy only reviewed rules/settings; never share credentials, sessions, plugin runtime, writable DBs, or caches. Refuse symlinked/hardlinked runtime or config files. No automatic cross-project config reuse.
+  - Auth is local Claude subscription login or Codex file storage only. Reject known auth/provider/remote/storage overrides at CLI/env/config boundaries without printing their values. Claude Console OAuth without an API key uses external state and is unsupported.
+  - This launcher is not an OS sandbox, full policy evaluator, or guarantee of provider identity.
+- **Default migration (`account migrate-default`)**: Verify zero processes in the default home before moving; keep only Codex `packages/standalone` in `~/.codex` and leave `~/.codex` without `auth.json` (Fail-Closed). Move `packages/app-server-daemon` and repoint its absolute `current` symlink. Refuse unknown packages, unsafe/uncheckable daemon symlinks, or unwritable dirs pre-move; roll back all journalled steps on any later failure (including registry write).
+- **Bindings & PATH**: One binding generator and one official executable resolver (skipping FlipAuth wrappers on PATH and recording the stable entry in the registry). `bind-current` refuses to write into the official executable's or official symlink's directory so upgrades cannot overwrite it. A generated staging file is not PATH deployment.
+- **Retired snapshot surface**: Never reintroduce credential copying, activation markers, or direct OAuth quota calls. `save/activate/login/quota/doctor/legacy` refuse before touching state; `*-switch` accepts only explicit `account` routes; `observe` stays a silent no-op.
 
-Named homes cannot overlap across services/accounts or the registry. Creation must
-explicitly choose `--bare` or a reviewed `--template`. Copy only reviewed rules and
-settings: credentials, sessions, plugin runtime, writable databases and caches must
-never be shared. Refuse symlinked/hardlinked runtime/config files. No automatic
-cross-project configuration reuse is authorized.
+## Selection, Observation & Switching
 
-Authentication is local Claude subscription login or Codex file storage. Reject known
-auth/provider/remote/storage overrides at CLI/environment/config boundaries without
-printing their values. The launcher is not the official project's/system's complete
-policy evaluator, an OS sandbox or a guarantee of provider identity. Claude Console
-OAuth without an API key uses state outside the config home and is unsupported.
+- **Non-switching commands**: `account run/login NAME`, `account current` (under startup gate), plain `codex` (or `bind-current` wrapper), and pass-through subcommands/flags (first arg only for subcommands) never stop peers or change selection. `account bind NAME PATH` creates a parallel launcher; `--switch` creates a switch launcher.
+- **Switch admission (`cod NAME` / `cc NAME` / `--switch` launchers)**:
+  - Requires a TTY; refuses when invoked from inside a CLI. No cross-account conversation resume or old-pane relaunch.
+  - Mixed-account state (`selected == NAME` with other-home processes running) refuses in preflight without stopping anything unless `--replace` is passed.
+  - When `selected != NAME` or `--replace` is set, stop only verified non-target CLIs and daemons (`home != target`), keeping target-home CLIs/daemons (`kept_cli`/`kept_daemon`), then `exec` one fresh CLI in the requesting terminal and cwd.
+- **Status & observation**: Report selection/default separately from observed PID/home/account facts. File presence and labels are never authenticated identity; never read tokens or make provider requests.
+- **`/proc` inspection**: Read NUL-delimited `/proc/<pid>/cmdline` (never `shlex.split(ps args)`). Match the executable, not spoofable argv0. Recognize native version-named Claude binaries (including older running versions post-upgrade). Exclude Codex code-mode/sandbox helpers and ordinary children with inherited env/args. Preserve UID, PID birth identity, and zombie handling.
+- **Serialization & preflight**: Hold one operation mutex and startup gate until `exec`. Preflight all PID births, registered homes, config, caller ancestry, and target login-file presence before signaling. Refuse uninspectable processes, unregistered homes, or unmanaged background servers. No detached switch worker.
+- **Per-service shutdown**:
+  - **Codex CLIs** (restore terminal only on keyboard quit): close in-band via Herdr `agent send-keys` only, re-checking PID birth after each foreground query and before each key (`Esc` while `agent_status == "working"`, `Ctrl+C` otherwise; on concurrent rejection wait briefly within stop deadline to confirm exit). Refuse if not in exactly one Herdr pane or headless. Never signal Codex, never write another PTY directly, never send confirming keys (`Enter`/`y`/digits).
+  - **Claude CLIs** (restore terminal on `SIGTERM`): terminate exact births via pidfd `SIGTERM` and wait for exit. Recheck this per-service split after major CLI upgrades with `work/directory-launcher/native-terminal-probe.py`.
+  - **Managed daemons & failure handling**: Stop verified Codex daemon updaters before servers (matched by boot ID, start ticks, home, argv). Never `SIGKILL`. Fail with a receipt if anything remains or appears; never auto-rollback/retry partial shutdown. Never explicitly start/restore a daemon or force `--no-daemon`. `exec-admitted` records handoff only; status verifies observation separately.
 
-## Selection, observation and switching
-
-- `account run/login NAME` sets the home and execs the official CLI. It does not change
-  selection or stop peers. Login is not a switch of an already-running process.
-- `account current` reads the launch preference under the startup gate.
-- `cod NAME` / `cc NAME` (and named launchers such as `codex-primary`) switch only when
-  a same-service CLI or daemon of another home is running:
-  - When `selected == NAME` and other-home processes are running (mixed-account state),
-    they refuse in preflight without stopping anything, listing the other-home PIDs/homes
-    and directing the user to plain `<service>` / `account run NAME` to join or `--replace`
-    to clear the other-home sessions.
-  - When `selected != NAME` or `--replace` is passed, they stop only verified non-target
-    CLIs (including busy ones) and non-target daemons (`home != target`), preserving
-    already-running target CLIs and target daemons (`kept_cli`/`kept_daemon` in the receipt),
-    before starting one fresh CLI in the requesting terminal and cwd.
-  - When only the target home (or nothing) runs, they start one more CLI and stop nothing.
-  Pass-through subcommands and flags (`exec`, `login`, `mcp`, `--version`, Claude `-p`, ...;
-  first argument only for subcommands) run in the named home without switching or selecting.
-  A switch needs a TTY; invoking a switch from inside a CLI is refused.
-  Plain `codex` is not a switch; without `bind-current` on PATH it runs the official
-  default home directly, and with `bind-current` installed on PATH in a separate
-  directory ahead of the official symlink (for example `~/.local/flipauth/bin/codex`)
-  it follows `selected` via `account current` without stopping peers.
-  `bind-current` refuses to write into the official executable's directory or official
-  symlink's directory so provider upgrades cannot overwrite it.
-  `account migrate-default NAME NEW_DIR` safely moves a default-home account to a dedicated
-  directory after verifying zero processes run in the default home, keeping only Codex
-  `packages/standalone` in `~/.codex` so standalone symlinks remain valid while leaving
-  `~/.codex` without `auth.json` (Fail-Closed). The per-home `packages/app-server-daemon`
-  moves with the account and its absolute `current` symlink is repointed into the new home;
-  unknown packages, unsafe/uncheckable daemon symlinks or unwritable directories refuse before
-  moving. Any later failure (including the registry write) rolls back every journalled step.
-  No cross-account conversation resume or relaunch in old panes.
-- Bindings use one generator and one official executable resolver. PATH discovery
-  skips FlipAuth wrappers; binding records the stable official entry in the registry.
-  A generated staging file is not deployment on the user's PATH.
-- `account bind NAME PATH --switch` creates a named switch launcher;
-  without `--switch`, it creates an ordinary parallel launcher.
-- Status reports selection/default separately from observed PID/home/account facts.
-  File presence and labels are never authenticated identity. No token reads or requests.
-
-Read actual argv from NUL-delimited `/proc/<pid>/cmdline`, never `shlex.split(ps args)`.
-Recognize native version-named Claude clients, including older running versions after
-an upgrade. Match the executable, not a spoofable argv0. Codex release directories
-also contain code-mode/sandbox helpers: those are not CLI sessions. Never classify
-an ordinary child from inherited config-root variables or arbitrary argument text.
-Preserve UID, PID birth identity and zombie handling.
-
-One operation mutex serializes switches and a startup gate prevents managed launches
-during shutdown; both remain held until exec. Preflight all process births, registered
-homes, config, caller ancestry and target login-file presence before sending a signal.
-Uninspectable processes, unregistered homes or unmanaged background servers refuse
-before termination. No detached switch worker or old-pane relaunch is used.
-
-Codex restores its terminal (raw mode, alternate screen, focus/paste/mouse reporting)
-only when it quits from its own keyboard input; every external signal leaves those
-modes enabled in the old terminal. Close Codex CLIs in-band through Herdr's `agent send-keys`
-(rejected once the agent no longer holds the pane), re-checking PID birth after each
-pane-foreground query and right before each key, until the PID is gone and the pane
-foreground no longer holds it: send `Esc` while Herdr reports `agent_status == "working"`
-(interrupting active turns or dismissing the `"Task is still running"` modal, which
-ignores subsequent `Ctrl+C`s), and send `Ctrl+C` otherwise (observed to cancel trust
-and command-approval overlays cleanly without confirming). If `agent send-keys` rejects
-right as the CLI exits, wait briefly (within the stop deadline) to confirm process exit
-rather than aborting with a false failure; refuse if it stays alive. A Codex CLI not in
-exactly one Herdr pane refuses during preflight. Never signal a Codex CLI, never write
-another process's PTY directly, and never send confirming keys (`Enter`/`y`/digits). A
-headless Codex outside any pane also refuses.
-Claude restores its terminal on SIGTERM: terminate exact Claude CLI births through
-pidfd SIGTERM, then wait for exit. Recheck this per-service split after a major CLI
-upgrade with `work/directory-launcher/native-terminal-probe.py`. Stop verified
-Codex daemon updaters before servers, using boot ID, PID start ticks, home and argv
-from official PID records. Never SIGKILL. If anything remains or a new process appears,
-stop with a failure receipt. Never explicitly start/restore a daemon or force
-`--no-daemon`: the newly exec'd official client owns automatic daemon startup.
-`exec-admitted` records the launch handoff; status separately checks whether that
-PID/start/home is actually observed. Neither establishes provider identity or request
-success. Do not automatically roll back or retry a partially completed shutdown.
-
-## Snapshot retirement
-
-Do not reintroduce credential copying, activation markers or direct OAuth quota calls.
-Old `save/activate/login/quota/doctor/legacy` routes refuse before touching state.
-`*-switch` accepts only explicit directory `account` routes. Existing files remain
-untouched. `observe` is a silent no-op for old statusLine callers. Legacy documentation
-and Git history are historical evidence, not runnable design or current test gates.
-
-## Verification
+## Verification & Public-Repo Safety
 
 ```sh
-bash tests/run-all.sh
-python3 tests/directory-accounts-test.py
-python3 tests/launcher-contract-test.py
-python3 tests/observation-test.py
-python3 tests/process-state-test.py
-python3 tests/short-commands-test.py
-python3 tests/magpie-cleanup-test.py
-bash -n ./flipauth
+bash tests/run-all.sh   # runs bash -n ./flipauth and all tests/*-test.py suites
 ```
 
-Tests use private disposable HOME/registry/homes, fake CLIs and controlled process
-indexes. Never let a test discover, signal or log into a real user CLI. Preserve meaningful
-checks for terminal/PID/argument behavior, concurrent ownership, native version naming,
-PATH wrappers and upgrades, zombie exits/PID reuse, managed-daemon records, single
-terminal admission and refusal of legacy mutations. No provider request is needed for any suite.
-
-Offline tests do not prove real identity or a deployed entrypoint. Real login, credential
-migration, peer shutdown, PATH deployment and publishing need appropriate user authority.
-Never commit credentials, private labels or local account notes. Use ignored
-`README.local.md`, `*.local.md`, or `docs/local/` for private operator notes.
-
-## Work records
-
-Short work is recorded by code, verification and Git. For expensive multi-session work,
-reuse one `work/<id>/card.md` with acceptance, boundaries, resume point and closure.
-Do not create another todo/journal. Read KANBAN before changing it; update for actual
-scope/decision/recovery changes. Reusable prevention goes in `lessons.md` as
-**When** / **Do** / **Evidence**, at most one per task.
+- Run individual suites via `python3 tests/<suite>-test.py` (`directory-accounts`, `launcher-contract`, `observation`, `process-state`, `short-commands`, `magpie-cleanup`) and `bash -n ./flipauth`.
+- Tests must use private disposable HOME/registry/homes, fake CLIs, and controlled process indexes. Never discover, signal, or log into a real user CLI, and make no provider requests.
+- Offline tests do not prove real identity or deployed PATH entrypoints. Real login, credential migration, peer shutdown, PATH deployment, and publishing require explicit user authority.
+- **Public repo privacy red line**: Never commit credentials, private labels, or local account notes. Keep private operator notes in gitignored `README.local.md`, `*.local.md`, or `docs/local/`.
+- For expensive multi-session work, track state in one `work/<id>/card.md` (do not create separate todos/journals).
 
 ## Shared assets
 
